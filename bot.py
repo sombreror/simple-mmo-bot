@@ -21,6 +21,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 API_KEY = os.getenv("API_KEY")
 CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
 GUILD_ID_RAW = os.getenv("GUILD_ID")
+RAID_ROLE_ID_RAW = os.getenv("RAID_ROLE_ID")  # opzionale: ruolo da pingare sui raid
 
 # Validazione robusta delle variabili d'ambiente
 errors = []
@@ -51,6 +52,14 @@ else:
 
 if errors:
     raise ValueError("\n".join(errors))
+
+# RAID_ROLE_ID è opzionale: se assente o non valido, semplicemente non si pinga nessun ruolo
+RAID_ROLE_ID = None
+if RAID_ROLE_ID_RAW:
+    try:
+        RAID_ROLE_ID = int(RAID_ROLE_ID_RAW)
+    except ValueError:
+        RAID_ROLE_ID = None
 
 
 # ==========================================================
@@ -100,6 +109,9 @@ last_raid_started = _state.get("last_raid_started")
 last_orphanage = _state.get("last_orphanage")
 
 last_check_time = None
+bot_start_time = time.time()
+raid_reminder_sent = False  # evita di mandare il promemoria di scadenza più volte per lo stesso raid
+RAID_REMINDER_MINUTES_BEFORE = 10  # quanto tempo prima della scadenza avvisare
 
 
 def persist_state():
@@ -225,21 +237,33 @@ async def get_orphanage():
 # ==========================================================
 
 
-async def check_raid():
+def is_new_raid(raid):
+    """Confronta il raid corrente con l'ultimo notificato. Ritorna True se è nuovo."""
     global last_raid_started
-
-    raid = await get_raid()
-    if raid is None:
-        return None
 
     started = raid.get("started_at")
 
     if started != last_raid_started:
         last_raid_started = started
         persist_state()
-        return raid
+        return True
 
-    return None
+    return False
+
+
+def raid_expiring_soon(raid):
+    """True se il raid è ancora attivo ma scade entro RAID_REMINDER_MINUTES_BEFORE minuti."""
+    expires = raid.get("expires_at")
+    if not expires:
+        return False
+
+    try:
+        dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+
+    remaining = (dt - datetime.now(timezone.utc)).total_seconds()
+    return 0 < remaining <= RAID_REMINDER_MINUTES_BEFORE * 60
 
 
 # ==========================================================
@@ -359,10 +383,22 @@ async def monitor():
         )
         return
 
-    raid = await check_raid()
-    if raid:
-        logger.info("New raid detected, sending notification")
-        await channel.send(embed=create_raid_embed(raid))
+    global raid_reminder_sent
+
+    raid = await get_raid()
+    if raid is not None:
+        if is_new_raid(raid):
+            logger.info("New raid detected, sending notification")
+            ping_content = f"<@&{RAID_ROLE_ID}>" if RAID_ROLE_ID else None
+            await channel.send(content=ping_content, embed=create_raid_embed(raid))
+            raid_reminder_sent = False
+        elif not raid_reminder_sent and raid_expiring_soon(raid):
+            logger.info("Raid expiring soon, sending reminder")
+            await channel.send(
+                f"⏰ Reminder: the current raid expires "
+                f"{parse_timestamp(raid.get('expires_at'))} — get in before it's gone!"
+            )
+            raid_reminder_sent = True
 
     orphanage = await check_orphanage()
     if orphanage:
@@ -402,10 +438,8 @@ async def on_disconnect():
 # ==========================================================
 
 
-@bot.tree.command(
-    name="testraid", description="Fetch and show the current guild raid status"
-)
-async def testraid(interaction: discord.Interaction):
+@bot.tree.command(name="raid", description="Show the current guild raid status")
+async def raid_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
     raid = await get_raid()
@@ -425,10 +459,8 @@ async def testraid(interaction: discord.Interaction):
     await interaction.followup.send(embed=create_raid_embed(raid))
 
 
-@bot.tree.command(
-    name="testorphanage", description="Fetch and show the current orphanage status"
-)
-async def testorphanage(interaction: discord.Interaction):
+@bot.tree.command(name="orphanage", description="Show the current orphanage status")
+async def orphanage_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
     data = await get_orphanage()
@@ -482,6 +514,14 @@ async def status(interaction: discord.Interaction):
 
     embed.timestamp = datetime.now(timezone.utc)
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="uptime", description="Show how long the bot has been running")
+async def uptime(interaction: discord.Interaction):
+    started_ts = int(bot_start_time)
+    await interaction.response.send_message(
+        f"🟢 Bot online since <t:{started_ts}:R> (<t:{started_ts}:f>)"
+    )
 
 
 # ==========================================================
