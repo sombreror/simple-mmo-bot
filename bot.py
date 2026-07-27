@@ -110,7 +110,9 @@ last_orphanage = _state.get("last_orphanage")
 
 last_check_time = None
 bot_start_time = time.time()
-raid_reminder_sent = False  # evita di mandare il promemoria di scadenza più volte per lo stesso raid
+raid_reminder_sent = (
+    False  # evita di mandare il promemoria di scadenza più volte per lo stesso raid
+)
 RAID_REMINDER_MINUTES_BEFORE = 10  # quanto tempo prima della scadenza avvisare
 
 
@@ -235,6 +237,20 @@ async def get_orphanage():
 # ==========================================================
 # RAID CHECK
 # ==========================================================
+
+
+def is_valid_raid(raid):
+    """True solo se il raid ha dati reali: location(s) presenti ed expires_at presente.
+    L'API restituisce comunque un oggetto quando non c'è nessun raid attivo
+    (started_at/locations/expires_at vuoti o null): questo va trattato come
+    'nessun raid', non come un nuovo raid da notificare."""
+    if raid is None:
+        return False
+
+    locations = raid.get("locations")
+    expires = raid.get("expires_at")
+
+    return bool(locations) and bool(expires)
 
 
 def is_new_raid(raid):
@@ -386,6 +402,10 @@ async def monitor():
     global raid_reminder_sent
 
     raid = await get_raid()
+    if raid is not None and not is_valid_raid(raid):
+        logger.info("No active raid (empty/placeholder data from API) — skipping")
+        raid = None
+
     if raid is not None:
         if is_new_raid(raid):
             logger.info("New raid detected, sending notification")
@@ -450,7 +470,7 @@ async def raid_command(interaction: discord.Interaction):
         )
         return
 
-    if not raid.get("started_at") and not raid.get("locations"):
+    if not is_valid_raid(raid):
         await interaction.followup.send(
             "ℹ️ No active guild raid right now. This is the real data from the API — it's just empty."
         )
