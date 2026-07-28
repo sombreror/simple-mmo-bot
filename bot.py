@@ -21,9 +21,9 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 API_KEY = os.getenv("API_KEY")
 CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
 GUILD_ID_RAW = os.getenv("GUILD_ID")
-RAID_ROLE_ID_RAW = os.getenv("RAID_ROLE_ID")  # opzionale: ruolo da pingare sui raid
+RAID_ROLE_ID_RAW = os.getenv("RAID_ROLE_ID")  # optional: role to ping on raids
 
-# Validazione robusta delle variabili d'ambiente
+# Robust environment variable validation
 errors = []
 
 if DISCORD_TOKEN is None:
@@ -32,7 +32,7 @@ if DISCORD_TOKEN is None:
 if API_KEY is None:
     errors.append("API_KEY missing in .env")
 else:
-    API_KEY = API_KEY.strip()  # rimuove eventuali spazi/newline accidentali
+    API_KEY = API_KEY.strip()  # remove accidental spaces/newlines
 
 if CHANNEL_ID_RAW is None:
     errors.append("CHANNEL_ID missing in .env")
@@ -53,7 +53,7 @@ else:
 if errors:
     raise ValueError("\n".join(errors))
 
-# RAID_ROLE_ID è opzionale: se assente o non valido, semplicemente non si pinga nessun ruolo
+# RAID_ROLE_ID is optional: if missing or invalid, no role is pinged
 RAID_ROLE_ID = None
 if RAID_ROLE_ID_RAW:
     try:
@@ -107,14 +107,23 @@ _state = load_state()
 
 last_raid_started = _state.get("last_raid_started")
 last_orphanage = _state.get("last_orphanage")
-last_worldboss = _state.get("last_worldboss", {})  # {boss_id: {"active": bool, "hp": int}}
-last_guild_task_key = _state.get("last_guild_task_key")  # es. "travel:30000"
+last_worldboss = _state.get(
+    "last_worldboss", {}
+)  # {boss_id: {"active": bool, "hp": int}}
+last_guild_task_key = _state.get("last_guild_task_key")  # e.g. "travel:30000"
 guild_task_completed_notified = _state.get("guild_task_completed_notified", False)
 
 last_check_time = None
 bot_start_time = time.time()
-raid_reminder_sent = False  # evita di mandare il promemoria di scadenza più volte per lo stesso raid
-RAID_REMINDER_MINUTES_BEFORE = 10  # quanto tempo prima della scadenza avvisare
+raid_reminder_sent = False  # avoids sending the expiry reminder more than once per raid
+RAID_REMINDER_MINUTES_BEFORE = 10  # how long before expiry to warn
+no_raid_logged = False  # avoids logging "no active raid" on every single check
+
+# Tracks consecutive 401 (auth) failures so we can warn the channel once,
+# instead of just filling up the logs silently.
+consecutive_401_count = 0
+auth_failure_notified = False
+AUTH_FAILURE_THRESHOLD = 3
 
 
 def persist_state():
@@ -133,24 +142,30 @@ def persist_state():
 # RATE LIMITER
 # ==========================================================
 
-# L'API di SimpleMMO ha un limite reale di 40 richieste/minuto
-# (vedi header "x-ratelimit-limit: 40" nelle risposte).
-# Teniamo un margine di sicurezza.
+# The SimpleMMO API has a real limit of 40 requests/minute
+# (see the "x-ratelimit-limit: 40" header in responses).
+# We keep a safety margin.
 MAX_REQUESTS_PER_MINUTE = 35
 
 request_times = deque()
 
 
-async def rate_limit():
+def _prune_request_times():
+    """Drop request timestamps older than 60s. Shared by the rate limiter
+    and /status, so the reported count is always fresh."""
     now = time.time()
-
     while request_times and request_times[0] < now - 60:
         request_times.popleft()
 
+
+async def rate_limit():
+    _prune_request_times()
+
     if len(request_times) >= MAX_REQUESTS_PER_MINUTE:
-        wait_time = 60 - (now - request_times[0])
+        wait_time = 60 - (time.time() - request_times[0])
         logger.warning(f"Rate limit reached. Waiting {wait_time:.2f}s")
         await asyncio.sleep(wait_time)
+        _prune_request_times()
 
     request_times.append(time.time())
 
@@ -180,17 +195,17 @@ async def close_session():
 # SIMPLEMMO API
 # ==========================================================
 #
-# L'API pubblica di SimpleMMO (https://web.simple-mmo.com/p-api/home)
-# richiede la api_key come QUERY PARAMETER nell'URL, non come header
-# Authorization. Esempio confermato funzionante:
+# The public SimpleMMO API (https://web.simple-mmo.com/p-api/home)
+# requires the api_key as a QUERY PARAMETER in the URL, not as an
+# Authorization header. Confirmed working example:
 #
 #   POST https://api.simple-mmo.com/v2/orphanage?api_key=XXXX
 #
-# (nessun header Authorization/Bearer, nessun body richiesto)
+# (no Authorization/Bearer header, no request body needed)
 
 
 async def smmo_request(endpoint, method="POST"):
-    """Make request to the SimpleMMO API using api_key as a query parameter."""
+    """Make a request to the SimpleMMO API using api_key as a query parameter."""
 
     await rate_limit()
 
@@ -215,12 +230,15 @@ async def smmo_request(endpoint, method="POST"):
 
 
 async def _handle_response(response, endpoint):
+    global consecutive_401_count, auth_failure_notified
+
     if response.status == 429:
         logger.error(f"API rate limit hit (429) on {endpoint}")
         return None
     if response.status == 401:
         body_text = await response.text()
         logger.warning(f"Auth failed (401) on {endpoint} — body: {body_text}")
+        consecutive_401_count += 1
         return None
     if response.status == 405:
         body_text = await response.text()
@@ -230,6 +248,10 @@ async def _handle_response(response, endpoint):
         body_text = await response.text()
         logger.error(f"API Error: {response.status} on {endpoint} — body: {body_text}")
         return None
+
+    # Any successful response clears the auth-failure streak.
+    consecutive_401_count = 0
+    auth_failure_notified = False
     return await response.json()
 
 
@@ -255,10 +277,10 @@ async def get_guild_task():
 
 
 def is_valid_raid(raid):
-    """True solo se il raid ha dati reali: location(s) presenti ed expires_at presente.
-    L'API restituisce comunque un oggetto quando non c'è nessun raid attivo
-    (started_at/locations/expires_at vuoti o null): questo va trattato come
-    'nessun raid', non come un nuovo raid da notificare."""
+    """True only if the raid has real data: location(s) and expires_at present.
+    The API still returns an object when no raid is active
+    (started_at/locations/expires_at empty or null): this must be treated as
+    'no raid', not as a new raid to notify about."""
     if raid is None:
         return False
 
@@ -269,7 +291,7 @@ def is_valid_raid(raid):
 
 
 def is_new_raid(raid):
-    """Confronta il raid corrente con l'ultimo notificato. Ritorna True se è nuovo."""
+    """Compares the current raid with the last one notified. Returns True if new."""
     global last_raid_started
 
     started = raid.get("started_at")
@@ -283,7 +305,7 @@ def is_new_raid(raid):
 
 
 def raid_expiring_soon(raid):
-    """True se il raid è ancora attivo ma scade entro RAID_REMINDER_MINUTES_BEFORE minuti."""
+    """True if the raid is still active but expires within RAID_REMINDER_MINUTES_BEFORE minutes."""
     expires = raid.get("expires_at")
     if not expires:
         return False
@@ -335,7 +357,7 @@ async def check_orphanage():
 
 
 def is_boss_active(boss, now=None):
-    """True se il boss è attivo ora: enable_time già passato e HP > 0."""
+    """True if the boss is active right now: enable_time already passed and HP > 0."""
     if now is None:
         now = time.time()
 
@@ -346,7 +368,7 @@ def is_boss_active(boss, now=None):
 
 
 async def check_worldboss():
-    """Ritorna (attivati, uccisi): liste di boss il cui stato è cambiato dall'ultimo check."""
+    """Returns (activated, killed): lists of bosses whose state changed since the last check."""
     global last_worldboss
 
     bosses = await get_worldboss()
@@ -389,7 +411,7 @@ async def check_worldboss():
 
 
 def is_valid_guild_task(task):
-    """True solo se il task ha dati reali (type e target_amount presenti/validi)."""
+    """True only if the task has real data (type and target_amount present/valid)."""
     if not task:
         return False
 
@@ -397,8 +419,8 @@ def is_valid_guild_task(task):
 
 
 async def check_guild_task():
-    """Ritorna ('new', task) se è un nuovo task, ('completed', task) se quello
-    corrente è appena stato completato, altrimenti None."""
+    """Returns ('new', task) if it's a new task, ('completed', task) if the
+    current one was just completed, otherwise None."""
     global last_guild_task_key, guild_task_completed_notified
 
     task = await get_guild_task()
@@ -463,6 +485,20 @@ def create_raid_embed(raid):
     return embed
 
 
+def create_raid_reminder_embed(raid):
+    embed = discord.Embed(
+        title="⏰ Raid Expiring Soon!",
+        description="The current raid is about to expire — get in before it's gone!",
+        color=0xFFA500,
+    )
+    embed.add_field(
+        name="Expires", value=parse_timestamp(raid.get("expires_at")), inline=False
+    )
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
+
+
 def create_orphanage_embed(orphanage):
     tier_name = orphanage.get("tier", {}).get("name", "Unknown Tier")
 
@@ -486,25 +522,43 @@ def create_orphanage_embed(orphanage):
     return embed
 
 
+def format_number(n):
+    """Abbreviates large numbers for readability while keeping the exact
+    value visible, e.g. 1,234,567 -> '1.2M (1,234,567)'."""
+    n = n or 0
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f}B ({n:,})"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M ({n:,})"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K ({n:,})"
+    return f"{n:,}"
+
+
 def create_worldboss_embed(boss, killed=False):
     name = boss.get("name", "Unknown")
     level = boss.get("level", "?")
 
     if killed:
         embed = discord.Embed(
-            title="💀 World Boss Sconfitto!",
-            description=f"**{name}** (Lv. {level}) è stato abbattuto!",
+            title="💀 World Boss Defeated!",
+            description=f"**{name}** (Lv. {level}) has been taken down!",
             color=0x888888,
         )
     else:
         embed = discord.Embed(
-            title="🔥 World Boss Attivo!",
-            description=f"**{name}** (Lv. {level}) è ora disponibile!",
+            title="🔥 World Boss Active!",
+            description=f"**{name}** (Lv. {level}) is now available!",
             color=0xFF8800,
         )
         hp = boss.get("current_hp", 0)
         max_hp = boss.get("max_hp", 0)
-        embed.add_field(name="❤️ HP", value=f"{hp:,} / {max_hp:,}", inline=False)
+        pct = int(hp / max_hp * 100) if max_hp else 0
+        embed.add_field(
+            name="❤️ HP",
+            value=f"{format_number(hp)} / {format_number(max_hp)} ({pct}%)",
+            inline=False,
+        )
 
     embed.set_footer(text="SimpleMMO Monitor")
     embed.timestamp = datetime.now(timezone.utc)
@@ -526,23 +580,29 @@ def create_guild_task_embed(task, completed=False):
 
     if completed:
         embed = discord.Embed(
-            title="✅ Guild Task Completato!",
-            description=f"Il task **{task_type}** è stato completato!",
+            title="✅ Guild Task Completed!",
+            description=f"The **{task_type}** task has been completed!",
             color=0x44FF44,
         )
     else:
         embed = discord.Embed(
-            title="📋 Nuovo Guild Task!",
-            description=f"Tipo: **{task_type}**",
+            title="📋 New Guild Task!",
+            description=f"Type: **{task_type}**",
             color=0x4488FF,
         )
+        current = task.get("current_amount", 0)
+        target = task.get("target_amount", 0)
+        bar, pct = _progress_bar(current, target)
+        embed.add_field(name="🎯 Target", value=f"{target:,}", inline=False)
         embed.add_field(
-            name="🎯 Obiettivo", value=f"{task.get('target_amount', 0):,}", inline=False
+            name="📊 Progress",
+            value=f"{current:,} / {target:,} ({pct}%)\n{bar}",
+            inline=False,
         )
 
     embed.add_field(
         name="🎁 Reward",
-        value=f"{exp_reward:,} EXP + {pp_reward:,} Power Points",
+        value=f"{format_number(exp_reward)} EXP + {format_number(pp_reward)} Power Points",
         inline=False,
     )
 
@@ -559,18 +619,35 @@ def create_guild_task_status_embed(task):
     bar, pct = _progress_bar(current, target)
 
     embed = discord.Embed(title="📋 Guild Task Status", color=0x4488FF)
-    embed.add_field(name="Tipo", value=task_type, inline=False)
-    embed.add_field(name="Progresso", value=f"{current:,} / {target:,} ({pct}%)", inline=False)
-    embed.add_field(name="Barra", value=bar, inline=False)
+    embed.add_field(name="Type", value=task_type, inline=False)
+    embed.add_field(
+        name="Progress", value=f"{current:,} / {target:,} ({pct}%)", inline=False
+    )
+    embed.add_field(name="Bar", value=bar, inline=False)
     embed.add_field(
         name="🎁 Reward",
-        value=f"{task.get('exp_reward', 0):,} EXP + {task.get('power_point_reward', 0):,} Power Points",
+        value=f"{format_number(task.get('exp_reward', 0))} EXP + {format_number(task.get('power_point_reward', 0))} Power Points",
         inline=False,
     )
 
     embed.set_footer(text="SimpleMMO Monitor")
     embed.timestamp = datetime.now(timezone.utc)
 
+    return embed
+
+
+def create_auth_failure_embed(count):
+    embed = discord.Embed(
+        title="🚨 API Authentication Failing",
+        description=(
+            f"The bot has failed to authenticate with the SimpleMMO API "
+            f"{count} times in a row. The API key may be invalid or expired — "
+            f"please check the `.env` configuration."
+        ),
+        color=0xFF0000,
+    )
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
     return embed
 
 
@@ -581,6 +658,15 @@ def create_guild_task_status_embed(task):
 
 @tasks.loop(minutes=1)
 async def monitor():
+    try:
+        await _monitor_tick()
+    except Exception:
+        # Never let an unexpected error silently kill the loop — log it
+        # with the full traceback and try again on the next tick.
+        logger.exception("Unexpected error during monitor tick")
+
+
+async def _monitor_tick():
     global last_check_time
     last_check_time = time.time()
 
@@ -597,14 +683,17 @@ async def monitor():
         )
         return
 
-    global raid_reminder_sent
+    global raid_reminder_sent, auth_failure_notified, no_raid_logged
 
     raid = await get_raid()
     if raid is not None and not is_valid_raid(raid):
-        logger.info("No active raid (empty/placeholder data from API) — skipping")
+        if not no_raid_logged:
+            logger.info("No active raid (empty/placeholder data from API)")
+            no_raid_logged = True
         raid = None
 
     if raid is not None:
+        no_raid_logged = False
         if is_new_raid(raid):
             logger.info("New raid detected, sending notification")
             ping_content = f"<@&{RAID_ROLE_ID}>" if RAID_ROLE_ID else None
@@ -612,10 +701,7 @@ async def monitor():
             raid_reminder_sent = False
         elif not raid_reminder_sent and raid_expiring_soon(raid):
             logger.info("Raid expiring soon, sending reminder")
-            await channel.send(
-                f"⏰ Reminder: the current raid expires "
-                f"{parse_timestamp(raid.get('expires_at'))} — get in before it's gone!"
-            )
+            await channel.send(embed=create_raid_reminder_embed(raid))
             raid_reminder_sent = True
 
     orphanage = await check_orphanage()
@@ -641,18 +727,35 @@ async def monitor():
             logger.info("Guild task completed, sending notification")
             await channel.send(embed=create_guild_task_embed(task, completed=True))
 
+    # Warn once if the API key seems to be failing repeatedly.
+    if consecutive_401_count >= AUTH_FAILURE_THRESHOLD and not auth_failure_notified:
+        logger.error(
+            f"{consecutive_401_count} consecutive auth failures, notifying channel"
+        )
+        await channel.send(embed=create_auth_failure_embed(consecutive_401_count))
+        auth_failure_notified = True
+
 
 # ==========================================================
 # EVENTS
 # ==========================================================
 
+_synced = False
+
 
 @bot.event
 async def on_ready():
+    global _synced
+
     logger.info(f"Bot connected as {bot.user}")
     logger.info(f"Guild ID: {GUILD_ID}")
 
-    await bot.tree.sync()
+    if not _synced:
+        await bot.tree.sync()
+        _synced = True
+        logger.info("Slash commands synced")
+    else:
+        logger.info("Slash commands already synced, skipping")
 
     if not monitor.is_running():
         monitor.start()
@@ -667,6 +770,38 @@ async def on_ready():
 async def on_disconnect():
     await close_session()
     logger.info("Session closed on disconnect")
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: discord.app_commands.AppCommandError
+):
+    """Catches errors from slash commands so users get a clear message
+    instead of Discord's generic 'Interaction failed'."""
+
+    if isinstance(error, discord.app_commands.CommandOnCooldown):
+        message = (
+            f"⏳ This command is on cooldown, try again in {error.retry_after:.1f}s."
+        )
+    elif isinstance(error, discord.app_commands.MissingPermissions):
+        message = "🚫 You don't have permission to use this command."
+    else:
+        logger.exception(
+            f"Unhandled error in command '{interaction.command.name if interaction.command else '?'}'",
+            exc_info=error,
+        )
+        message = (
+            "⚠️ Something went wrong while running this command. It's been logged."
+        )
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        # Interaction already expired/invalid — nothing more we can do.
+        pass
 
 
 # ==========================================================
@@ -714,7 +849,7 @@ async def orphanage_command(interaction: discord.Interaction):
             break
 
     if active is None:
-        # Nessun tier attivo: mostriamo comunque quello con più progresso, per contesto
+        # No active tier: show the one with the most progress anyway, for context.
         closest = max(data, key=lambda t: t.get("percentage", 0), default=None)
         if closest:
             pct = closest.get("percentage", 0)
@@ -774,7 +909,7 @@ async def worldboss_command(interaction: discord.Interaction):
         pct = int(hp / max_hp * 100) if max_hp else 0
         embed.add_field(
             name=f"{boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
-            value=f"HP: {hp:,} / {max_hp:,} ({pct}%)",
+            value=f"HP: {format_number(hp)} / {format_number(max_hp)} ({pct}%)",
             inline=False,
         )
     embed.timestamp = datetime.now(timezone.utc)
@@ -784,6 +919,7 @@ async def worldboss_command(interaction: discord.Interaction):
 
 @bot.tree.command(name="status", description="Show bot status")
 async def status(interaction: discord.Interaction):
+    _prune_request_times()
     requests_count = len(request_times)
 
     embed = discord.Embed(title="🤖 SimpleMMO Bot Status", color=0x4444FF)
@@ -791,7 +927,7 @@ async def status(interaction: discord.Interaction):
     embed.add_field(name="Status", value="🟢 Online", inline=False)
     embed.add_field(name="Guild ID", value=str(GUILD_ID), inline=False)
     embed.add_field(
-        name="API Requests",
+        name="API Requests (last minute)",
         value=f"{requests_count}/{MAX_REQUESTS_PER_MINUTE}",
         inline=False,
     )
