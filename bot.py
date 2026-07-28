@@ -107,18 +107,25 @@ _state = load_state()
 
 last_raid_started = _state.get("last_raid_started")
 last_orphanage = _state.get("last_orphanage")
+last_worldboss = _state.get("last_worldboss", {})  # {boss_id: {"active": bool, "hp": int}}
+last_guild_task_key = _state.get("last_guild_task_key")  # es. "travel:30000"
+guild_task_completed_notified = _state.get("guild_task_completed_notified", False)
 
 last_check_time = None
 bot_start_time = time.time()
-raid_reminder_sent = (
-    False  # evita di mandare il promemoria di scadenza più volte per lo stesso raid
-)
+raid_reminder_sent = False  # evita di mandare il promemoria di scadenza più volte per lo stesso raid
 RAID_REMINDER_MINUTES_BEFORE = 10  # quanto tempo prima della scadenza avvisare
 
 
 def persist_state():
     save_state(
-        {"last_raid_started": last_raid_started, "last_orphanage": last_orphanage}
+        {
+            "last_raid_started": last_raid_started,
+            "last_orphanage": last_orphanage,
+            "last_worldboss": last_worldboss,
+            "last_guild_task_key": last_guild_task_key,
+            "guild_task_completed_notified": guild_task_completed_notified,
+        }
     )
 
 
@@ -234,6 +241,14 @@ async def get_orphanage():
     return await smmo_request("/v2/orphanage")
 
 
+async def get_worldboss():
+    return await smmo_request("/v1/worldboss/all")
+
+
+async def get_guild_task():
+    return await smmo_request(f"/v1/guilds/task/{GUILD_ID}")
+
+
 # ==========================================================
 # RAID CHECK
 # ==========================================================
@@ -315,6 +330,101 @@ async def check_orphanage():
 
 
 # ==========================================================
+# WORLD BOSS CHECK
+# ==========================================================
+
+
+def is_boss_active(boss, now=None):
+    """True se il boss è attivo ora: enable_time già passato e HP > 0."""
+    if now is None:
+        now = time.time()
+
+    enable_time = boss.get("enable_time") or 0
+    current_hp = boss.get("current_hp") or 0
+
+    return enable_time <= now and current_hp > 0
+
+
+async def check_worldboss():
+    """Ritorna (attivati, uccisi): liste di boss il cui stato è cambiato dall'ultimo check."""
+    global last_worldboss
+
+    bosses = await get_worldboss()
+    if not bosses:
+        return [], []
+
+    now = time.time()
+    new_state = {}
+    activated = []
+    killed = []
+
+    for boss in bosses:
+        boss_id = str(boss.get("id"))
+        if boss_id == "None":
+            continue
+
+        active_now = is_boss_active(boss, now)
+        current_hp = boss.get("current_hp") or 0
+
+        prev = last_worldboss.get(boss_id, {})
+        was_active = prev.get("active", False)
+
+        if active_now and not was_active:
+            activated.append(boss)
+        elif was_active and current_hp <= 0:
+            killed.append(boss)
+
+        new_state[boss_id] = {"active": active_now, "hp": current_hp}
+
+    if new_state != last_worldboss:
+        last_worldboss = new_state
+        persist_state()
+
+    return activated, killed
+
+
+# ==========================================================
+# GUILD TASK CHECK
+# ==========================================================
+
+
+def is_valid_guild_task(task):
+    """True solo se il task ha dati reali (type e target_amount presenti/validi)."""
+    if not task:
+        return False
+
+    return bool(task.get("type")) and bool(task.get("target_amount"))
+
+
+async def check_guild_task():
+    """Ritorna ('new', task) se è un nuovo task, ('completed', task) se quello
+    corrente è appena stato completato, altrimenti None."""
+    global last_guild_task_key, guild_task_completed_notified
+
+    task = await get_guild_task()
+    if not is_valid_guild_task(task):
+        return None
+
+    task_type = task.get("type")
+    target = task.get("target_amount")
+    current = task.get("current_amount", 0)
+    key = f"{task_type}:{target}"
+
+    if key != last_guild_task_key:
+        last_guild_task_key = key
+        guild_task_completed_notified = False
+        persist_state()
+        return ("new", task)
+
+    if current >= target and not guild_task_completed_notified:
+        guild_task_completed_notified = True
+        persist_state()
+        return ("completed", task)
+
+    return None
+
+
+# ==========================================================
 # DISCORD EMBEDS
 # ==========================================================
 
@@ -376,6 +486,94 @@ def create_orphanage_embed(orphanage):
     return embed
 
 
+def create_worldboss_embed(boss, killed=False):
+    name = boss.get("name", "Unknown")
+    level = boss.get("level", "?")
+
+    if killed:
+        embed = discord.Embed(
+            title="💀 World Boss Sconfitto!",
+            description=f"**{name}** (Lv. {level}) è stato abbattuto!",
+            color=0x888888,
+        )
+    else:
+        embed = discord.Embed(
+            title="🔥 World Boss Attivo!",
+            description=f"**{name}** (Lv. {level}) è ora disponibile!",
+            color=0xFF8800,
+        )
+        hp = boss.get("current_hp", 0)
+        max_hp = boss.get("max_hp", 0)
+        embed.add_field(name="❤️ HP", value=f"{hp:,} / {max_hp:,}", inline=False)
+
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
+
+    return embed
+
+
+def _progress_bar(current, target, length=20):
+    pct = 0 if not target else min(100, int(current / target * 100))
+    filled = int(length * pct / 100)
+    bar = "█" * filled + "░" * (length - filled)
+    return bar, pct
+
+
+def create_guild_task_embed(task, completed=False):
+    task_type = str(task.get("type", "Unknown")).capitalize()
+    exp_reward = task.get("exp_reward", 0)
+    pp_reward = task.get("power_point_reward", 0)
+
+    if completed:
+        embed = discord.Embed(
+            title="✅ Guild Task Completato!",
+            description=f"Il task **{task_type}** è stato completato!",
+            color=0x44FF44,
+        )
+    else:
+        embed = discord.Embed(
+            title="📋 Nuovo Guild Task!",
+            description=f"Tipo: **{task_type}**",
+            color=0x4488FF,
+        )
+        embed.add_field(
+            name="🎯 Obiettivo", value=f"{task.get('target_amount', 0):,}", inline=False
+        )
+
+    embed.add_field(
+        name="🎁 Reward",
+        value=f"{exp_reward:,} EXP + {pp_reward:,} Power Points",
+        inline=False,
+    )
+
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
+
+    return embed
+
+
+def create_guild_task_status_embed(task):
+    task_type = str(task.get("type", "Unknown")).capitalize()
+    current = task.get("current_amount", 0)
+    target = task.get("target_amount", 0)
+    bar, pct = _progress_bar(current, target)
+
+    embed = discord.Embed(title="📋 Guild Task Status", color=0x4488FF)
+    embed.add_field(name="Tipo", value=task_type, inline=False)
+    embed.add_field(name="Progresso", value=f"{current:,} / {target:,} ({pct}%)", inline=False)
+    embed.add_field(name="Barra", value=bar, inline=False)
+    embed.add_field(
+        name="🎁 Reward",
+        value=f"{task.get('exp_reward', 0):,} EXP + {task.get('power_point_reward', 0):,} Power Points",
+        inline=False,
+    )
+
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
+
+    return embed
+
+
 # ==========================================================
 # BACKGROUND MONITOR
 # ==========================================================
@@ -424,6 +622,24 @@ async def monitor():
     if orphanage:
         logger.info("New orphanage event detected, sending notification")
         await channel.send(embed=create_orphanage_embed(orphanage))
+
+    boss_activated, boss_killed = await check_worldboss()
+    for boss in boss_activated:
+        logger.info(f"World boss activated: {boss.get('name')}")
+        await channel.send(embed=create_worldboss_embed(boss, killed=False))
+    for boss in boss_killed:
+        logger.info(f"World boss killed: {boss.get('name')}")
+        await channel.send(embed=create_worldboss_embed(boss, killed=True))
+
+    task_event = await check_guild_task()
+    if task_event:
+        event_type, task = task_event
+        if event_type == "new":
+            logger.info("New guild task detected, sending notification")
+            await channel.send(embed=create_guild_task_embed(task, completed=False))
+        elif event_type == "completed":
+            logger.info("Guild task completed, sending notification")
+            await channel.send(embed=create_guild_task_embed(task, completed=True))
 
 
 # ==========================================================
@@ -511,6 +727,59 @@ async def orphanage_command(interaction: discord.Interaction):
         return
 
     await interaction.followup.send(embed=create_orphanage_embed(active))
+
+
+@bot.tree.command(name="task", description="Show the current guild task status")
+async def task_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    task = await get_guild_task()
+
+    if task is None:
+        await interaction.followup.send(
+            "⚠️ Couldn't fetch guild task data from the API right now. Check the logs for details."
+        )
+        return
+
+    if not is_valid_guild_task(task):
+        await interaction.followup.send("ℹ️ No active guild task right now.")
+        return
+
+    await interaction.followup.send(embed=create_guild_task_status_embed(task))
+
+
+@bot.tree.command(name="worldboss", description="Show active world bosses")
+async def worldboss_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    bosses = await get_worldboss()
+
+    if bosses is None:
+        await interaction.followup.send(
+            "⚠️ Couldn't fetch world boss data from the API right now. Check the logs for details."
+        )
+        return
+
+    now = time.time()
+    active_bosses = [b for b in bosses if is_boss_active(b, now)]
+
+    if not active_bosses:
+        await interaction.followup.send("ℹ️ No world boss is currently active.")
+        return
+
+    embed = discord.Embed(title="🔥 Active World Bosses", color=0xFF8800)
+    for boss in active_bosses:
+        hp = boss.get("current_hp", 0)
+        max_hp = boss.get("max_hp", 1)
+        pct = int(hp / max_hp * 100) if max_hp else 0
+        embed.add_field(
+            name=f"{boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
+            value=f"HP: {hp:,} / {max_hp:,} ({pct}%)",
+            inline=False,
+        )
+    embed.timestamp = datetime.now(timezone.utc)
+
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="status", description="Show bot status")

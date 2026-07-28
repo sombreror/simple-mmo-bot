@@ -1,4 +1,56 @@
 {
-  "last_raid_started": "2026-07-27T14:45:06.000000Z",
-  "last_orphanage": null
+  "last_raid_started": "2026-07-28T12:32:25.000000Z",
+  "last_orphanage": null,
+  "last_worldboss": {
+    "3742": {
+      "active": false,
+      "hp": 236270776
+    },
+    "3743": {
+      "active": false,
+      "hp": 3904444
+    },
+    "3744": {
+      "active": false,
+      "hp": 11033874
+    },
+    "3745": {
+      "active": false,
+      "hp": 15245639
+    },
+    "3747": {
+      "active": false,
+      "hp": 34072402
+    },
+    "3748": {
+      "active": false,
+      "hp": 60255329
+    },
+    "3749": {
+      "active": false,
+      "hp": 25209010
+    },
+    "3750": {
+      "active": false,
+      "hp": 102432140
+    },
+    "3751": {
+      "active": false,
+      "hp": 86241652
+    },
+    "3752": {
+      "active": false,
+      "hp": 75688723
+    },
+    "3753": {
+      "active": false,
+      "hp": 193429109
+    },
+    "3754": {
+      "active": false,
+      "hp": 627728802
+    }
+  },
+  "last_guild_task_key": "npc:7500",
+  "guild_task_completed_notified": false
 }
