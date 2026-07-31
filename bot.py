@@ -119,6 +119,12 @@ raid_reminder_sent = False  # avoids sending the expiry reminder more than once 
 RAID_REMINDER_MINUTES_BEFORE = 10  # how long before expiry to warn
 no_raid_logged = False  # avoids logging "no active raid" on every single check
 
+# World boss "incoming soon" reminder: warns once per boss cycle, this many
+# minutes before its enable_time. Keyed by boss_id -> enable_time already
+# notified for, so a new cycle (different enable_time) can be re-notified.
+WORLDBOSS_REMINDER_MINUTES_BEFORE = 60
+worldboss_reminder_notified_for = {}  # {boss_id: enable_time}
+
 # Tracks consecutive 401 (auth) failures so we can warn the channel once,
 # instead of just filling up the logs silently.
 consecutive_401_count = 0
@@ -367,13 +373,45 @@ def is_boss_active(boss, now=None):
     return enable_time <= now and current_hp > 0
 
 
+def get_upcoming_worldboss(bosses, now=None):
+    """Returns the boss whose enable_time is in the future and closest to now
+    (i.e. the next world boss to spawn), or None if no boss has a future
+    enable_time. enable_time in the SimpleMMO API is an absolute Unix
+    timestamp, not a relative countdown."""
+    if now is None:
+        now = time.time()
+
+    upcoming = [b for b in bosses if (b.get("enable_time") or 0) > now]
+    if not upcoming:
+        return None
+
+    return min(upcoming, key=lambda b: b.get("enable_time"))
+
+
+def worldboss_incoming_soon(boss, now=None):
+    """True if the given (not yet active) boss's enable_time falls within
+    WORLDBOSS_REMINDER_MINUTES_BEFORE minutes from now."""
+    if now is None:
+        now = time.time()
+
+    enable_time = boss.get("enable_time") or 0
+    remaining = enable_time - now
+    return 0 < remaining <= WORLDBOSS_REMINDER_MINUTES_BEFORE * 60
+
+
 async def check_worldboss():
-    """Returns (activated, killed): lists of bosses whose state changed since the last check."""
-    global last_worldboss
+    """Returns (activated, killed, incoming):
+    - activated: bosses whose state changed from inactive to active since the last check
+    - killed: bosses whose state changed from active to dead (hp <= 0) since the last check
+    - incoming: the next upcoming boss if it's about to spawn within
+      WORLDBOSS_REMINDER_MINUTES_BEFORE minutes and hasn't been notified yet
+      for this specific enable_time, otherwise None
+    """
+    global last_worldboss, worldboss_reminder_notified_for
 
     bosses = await get_worldboss()
     if not bosses:
-        return [], []
+        return [], [], None
 
     now = time.time()
     new_state = {}
@@ -402,7 +440,24 @@ async def check_worldboss():
         last_worldboss = new_state
         persist_state()
 
-    return activated, killed
+    # Check whether the next upcoming (not yet active) boss should trigger a
+    # "spawning soon" reminder. Tracked per boss_id + enable_time so a new
+    # spawn cycle for the same boss can be notified again.
+    incoming = None
+    next_boss = get_upcoming_worldboss(bosses, now)
+    if next_boss is not None:
+        boss_id = str(next_boss.get("id"))
+        enable_time = next_boss.get("enable_time")
+        already_notified_for = worldboss_reminder_notified_for.get(boss_id)
+
+        if (
+            worldboss_incoming_soon(next_boss, now)
+            and already_notified_for != enable_time
+        ):
+            incoming = next_boss
+            worldboss_reminder_notified_for[boss_id] = enable_time
+
+    return activated, killed, incoming
 
 
 # ==========================================================
@@ -460,6 +515,15 @@ def parse_timestamp(ts_str):
         return f"<t:{unix_ts}:R>"
     except ValueError:
         return ts_str
+
+
+def format_unix_relative(unix_ts):
+    """Formats a raw Unix timestamp (int/float) as a Discord relative
+    timestamp, e.g. 'in 3 hours'. Used for world boss enable_time, which is
+    already a Unix timestamp (unlike the ISO strings used elsewhere)."""
+    if not unix_ts:
+        return "Unknown"
+    return f"<t:{int(unix_ts)}:R>"
 
 
 def create_raid_embed(raid):
@@ -563,6 +627,25 @@ def create_worldboss_embed(boss, killed=False):
     embed.set_footer(text="SimpleMMO Monitor")
     embed.timestamp = datetime.now(timezone.utc)
 
+    return embed
+
+
+def create_worldboss_incoming_embed(boss):
+    """Embed for the 'next world boss is about to spawn' reminder."""
+    name = boss.get("name", "Unknown")
+    level = boss.get("level", "?")
+    enable_time = boss.get("enable_time")
+
+    embed = discord.Embed(
+        title="⏳ World Boss Incoming!",
+        description=f"**{name}** (Lv. {level}) will spawn soon!",
+        color=0xFFA500,
+    )
+    embed.add_field(
+        name="🕐 Spawns", value=format_unix_relative(enable_time), inline=False
+    )
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
     return embed
 
 
@@ -709,13 +792,16 @@ async def _monitor_tick():
         logger.info("New orphanage event detected, sending notification")
         await channel.send(embed=create_orphanage_embed(orphanage))
 
-    boss_activated, boss_killed = await check_worldboss()
+    boss_activated, boss_killed, boss_incoming = await check_worldboss()
     for boss in boss_activated:
         logger.info(f"World boss activated: {boss.get('name')}")
         await channel.send(embed=create_worldboss_embed(boss, killed=False))
     for boss in boss_killed:
         logger.info(f"World boss killed: {boss.get('name')}")
         await channel.send(embed=create_worldboss_embed(boss, killed=True))
+    if boss_incoming:
+        logger.info(f"World boss incoming soon: {boss_incoming.get('name')}")
+        await channel.send(embed=create_worldboss_incoming_embed(boss_incoming))
 
     task_event = await check_guild_task()
     if task_event:
@@ -899,19 +985,34 @@ async def worldboss_command(interaction: discord.Interaction):
     active_bosses = [b for b in bosses if is_boss_active(b, now)]
 
     if not active_bosses:
-        await interaction.followup.send("ℹ️ No world boss is currently active.")
-        return
-
-    embed = discord.Embed(title="🔥 Active World Bosses", color=0xFF8800)
-    for boss in active_bosses:
-        hp = boss.get("current_hp", 0)
-        max_hp = boss.get("max_hp", 1)
-        pct = int(hp / max_hp * 100) if max_hp else 0
+        embed = discord.Embed(title="🔥 World Bosses", color=0xFF8800)
         embed.add_field(
-            name=f"{boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
-            value=f"HP: {format_number(hp)} / {format_number(max_hp)} ({pct}%)",
+            name="Status", value="ℹ️ No world boss is currently active.", inline=False
+        )
+    else:
+        embed = discord.Embed(title="🔥 Active World Bosses", color=0xFF8800)
+        for boss in active_bosses:
+            hp = boss.get("current_hp", 0)
+            max_hp = boss.get("max_hp", 1)
+            pct = int(hp / max_hp * 100) if max_hp else 0
+            embed.add_field(
+                name=f"{boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
+                value=f"HP: {format_number(hp)} / {format_number(max_hp)} ({pct}%)",
+                inline=False,
+            )
+
+    # Always show the next upcoming boss countdown too, if there is one.
+    next_boss = get_upcoming_worldboss(bosses, now)
+    if next_boss:
+        embed.add_field(
+            name="⏳ Next World Boss",
+            value=(
+                f"{next_boss.get('name', 'Unknown')} (Lv. {next_boss.get('level', '?')}) "
+                f"— spawns {format_unix_relative(next_boss.get('enable_time'))}"
+            ),
             inline=False,
         )
+
     embed.timestamp = datetime.now(timezone.utc)
 
     await interaction.followup.send(embed=embed)

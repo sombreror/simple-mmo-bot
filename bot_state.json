@@ -1,14 +1,10 @@
 {
-  "last_raid_started": "2026-07-29T13:06:25.000000Z",
+  "last_raid_started": "2026-07-31T13:48:59.000000Z",
   "last_orphanage": null,
   "last_worldboss": {
     "3742": {
       "active": false,
       "hp": 236270776
-    },
-    "3743": {
-      "active": false,
-      "hp": 3904444
     },
     "3747": {
       "active": false,
@@ -21,10 +17,6 @@
     "3749": {
       "active": false,
       "hp": 25209010
-    },
-    "3750": {
-      "active": false,
-      "hp": 102432140
     },
     "3751": {
       "active": false,
