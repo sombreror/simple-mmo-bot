@@ -4,9 +4,13 @@ from discord.ext import commands, tasks
 import aiohttp
 import asyncio
 import os
+import re
+import signal
+import tempfile
 import time
 import json
 import logging
+import traceback
 from datetime import datetime, timezone
 from collections import deque
 from dotenv import load_dotenv
@@ -66,11 +70,38 @@ if RAID_ROLE_ID_RAW:
 # LOGGING SETUP
 # ==========================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()],
+
+class JsonFormatter(logging.Formatter):
+    """Renders each log record as a single JSON object per line, so logs
+    can be ingested/searched by external tools instead of parsed as free text."""
+
+    def format(self, record):
+        payload = {
+            "timestamp": datetime.fromtimestamp(
+                record.created, tz=timezone.utc
+            ).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+
+        if record.exc_info:
+            payload["exception"] = "".join(
+                traceback.format_exception(*record.exc_info)
+            )
+
+        return json.dumps(payload, ensure_ascii=False)
+
+
+_json_handler_file = logging.FileHandler("bot.log")
+_json_handler_file.setFormatter(JsonFormatter())
+
+_plain_handler_stream = logging.StreamHandler()
+_plain_handler_stream.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 )
+
+logging.basicConfig(level=logging.INFO, handlers=[_json_handler_file, _plain_handler_stream])
 logger = logging.getLogger(__name__)
 
 
@@ -99,8 +130,23 @@ def load_state():
 
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    """Writes state atomically: write to a temp file in the same directory,
+    then os.replace() it over the real file. This avoids leaving a
+    truncated/corrupted bot_state.json behind if the process is killed or
+    crashes mid-write."""
+    directory = os.path.dirname(os.path.abspath(STATE_FILE))
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".bot_state_", suffix=".tmp", dir=directory
+        )
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp_path, STATE_FILE)
+    except OSError as e:
+        logger.error(f"Failed to persist state: {e}")
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 _state = load_state()
@@ -115,20 +161,29 @@ guild_task_completed_notified = _state.get("guild_task_completed_notified", Fals
 
 last_check_time = None
 bot_start_time = time.time()
-raid_reminder_sent = False  # avoids sending the expiry reminder more than once per raid
+
+# Persisted now (item 9): these used to live only in memory and reset on
+# every restart, which could cause duplicate notifications right after a
+# restart that happened to land near an event.
+raid_reminder_sent = _state.get("raid_reminder_sent", False)
 RAID_REMINDER_MINUTES_BEFORE = 10  # how long before expiry to warn
-no_raid_logged = False  # avoids logging "no active raid" on every single check
+no_raid_logged = _state.get("no_raid_logged", False)  # avoids logging "no active raid" on every single check
 
 # World boss "incoming soon" reminder: warns once per boss cycle, this many
 # minutes before its enable_time. Keyed by boss_id -> enable_time already
 # notified for, so a new cycle (different enable_time) can be re-notified.
 WORLDBOSS_REMINDER_MINUTES_BEFORE = 60
-worldboss_reminder_notified_for = {}  # {boss_id: enable_time}
+worldboss_reminder_notified_for = _state.get("worldboss_reminder_notified_for", {})  # {boss_id: enable_time}
 
-# Tracks consecutive 401 (auth) failures so we can warn the channel once,
-# instead of just filling up the logs silently.
-consecutive_401_count = 0
-auth_failure_notified = False
+# Tracks consecutive 401 (auth) failures PER ENDPOINT, so one endpoint
+# failing repeatedly can't be masked by another endpoint that's still
+# succeeding (each endpoint clears only its own streak on success).
+# This dict is ephemeral (not persisted): a fresh count on restart is fine,
+# it just takes a few more ticks to re-detect an ongoing failure.
+consecutive_401_counts = {}  # {endpoint: count}
+# This one IS persisted, so a restart doesn't cause the same ongoing auth
+# failure to be re-announced every time the bot restarts.
+auth_failure_notified_endpoints = _state.get("auth_failure_notified_endpoints", {})  # {endpoint: True}
 AUTH_FAILURE_THRESHOLD = 3
 
 
@@ -140,6 +195,10 @@ def persist_state():
             "last_worldboss": last_worldboss,
             "last_guild_task_key": last_guild_task_key,
             "guild_task_completed_notified": guild_task_completed_notified,
+            "raid_reminder_sent": raid_reminder_sent,
+            "no_raid_logged": no_raid_logged,
+            "worldboss_reminder_notified_for": worldboss_reminder_notified_for,
+            "auth_failure_notified_endpoints": auth_failure_notified_endpoints,
         }
     )
 
@@ -152,6 +211,10 @@ def persist_state():
 # (see the "x-ratelimit-limit: 40" header in responses).
 # We keep a safety margin.
 MAX_REQUESTS_PER_MINUTE = 35
+
+# How long to wait for a single SimpleMMO API call before giving up. Without
+# this, a stalled/hanging response could block the monitor tick indefinitely.
+HTTP_TIMEOUT_SECONDS = 15
 
 request_times = deque()
 
@@ -186,7 +249,8 @@ _session = None
 async def get_session():
     global _session
     if _session is None or _session.closed:
-        _session = aiohttp.ClientSession()
+        timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+        _session = aiohttp.ClientSession(timeout=timeout)
     return _session
 
 
@@ -210,6 +274,13 @@ async def close_session():
 # (no Authorization/Bearer header, no request body needed)
 
 
+def _mask_secret(text):
+    """Strips the api_key value out of any string before it's logged. aiohttp
+    exceptions often embed the full request URL in their string
+    representation, which would otherwise leak the key into bot.log."""
+    return re.sub(r"(api_key=)[^&\s'\")]+", r"\1***", str(text))
+
+
 async def smmo_request(endpoint, method="POST"):
     """Make a request to the SimpleMMO API using api_key as a query parameter."""
 
@@ -228,15 +299,15 @@ async def smmo_request(endpoint, method="POST"):
             async with session.get(url) as response:
                 return await _handle_response(response, endpoint)
     except aiohttp.ClientError as e:
-        logger.error(f"Network error on {endpoint}: {e}")
+        logger.error(f"Network error on {endpoint}: {_mask_secret(e)}")
         return None
     except Exception as e:
-        logger.error(f"Unexpected error on {endpoint}: {e}")
+        logger.error(f"Unexpected error on {endpoint}: {_mask_secret(e)}")
         return None
 
 
 async def _handle_response(response, endpoint):
-    global consecutive_401_count, auth_failure_notified
+    global auth_failure_notified_endpoints
 
     if response.status == 429:
         logger.error(f"API rate limit hit (429) on {endpoint}")
@@ -244,7 +315,7 @@ async def _handle_response(response, endpoint):
     if response.status == 401:
         body_text = await response.text()
         logger.warning(f"Auth failed (401) on {endpoint} — body: {body_text}")
-        consecutive_401_count += 1
+        consecutive_401_counts[endpoint] = consecutive_401_counts.get(endpoint, 0) + 1
         return None
     if response.status == 405:
         body_text = await response.text()
@@ -255,9 +326,12 @@ async def _handle_response(response, endpoint):
         logger.error(f"API Error: {response.status} on {endpoint} — body: {body_text}")
         return None
 
-    # Any successful response clears the auth-failure streak.
-    consecutive_401_count = 0
-    auth_failure_notified = False
+    # A successful response clears only THIS endpoint's auth-failure streak,
+    # so a healthy endpoint can't mask another endpoint that keeps failing.
+    consecutive_401_counts.pop(endpoint, None)
+    if endpoint in auth_failure_notified_endpoints:
+        del auth_failure_notified_endpoints[endpoint]
+        persist_state()
     return await response.json()
 
 
@@ -296,18 +370,18 @@ def is_valid_raid(raid):
     return bool(locations) and bool(expires)
 
 
-def is_new_raid(raid):
-    """Compares the current raid with the last one notified. Returns True if new."""
+def raid_is_new(raid, last_started):
+    """Pure comparison: True if this raid's started_at differs from
+    last_started. Does not mutate any state — the caller decides whether and
+    when to call commit_raid_seen() to actually record it."""
+    return raid.get("started_at") != last_started
+
+
+def commit_raid_seen(raid):
+    """Records this raid's started_at as the last one seen/notified, and persists it."""
     global last_raid_started
-
-    started = raid.get("started_at")
-
-    if started != last_raid_started:
-        last_raid_started = started
-        persist_state()
-        return True
-
-    return False
+    last_raid_started = raid.get("started_at")
+    persist_state()
 
 
 def raid_expiring_soon(raid):
@@ -373,19 +447,25 @@ def is_boss_active(boss, now=None):
     return enable_time <= now and current_hp > 0
 
 
-def get_upcoming_worldboss(bosses, now=None):
-    """Returns the boss whose enable_time is in the future and closest to now
-    (i.e. the next world boss to spawn), or None if no boss has a future
-    enable_time. enable_time in the SimpleMMO API is an absolute Unix
-    timestamp, not a relative countdown."""
+def get_upcoming_worldbosses(bosses, now=None, limit=1):
+    """Returns up to `limit` bosses that haven't spawned yet, sorted by
+    soonest enable_time first (i.e. the next bosses to spawn). enable_time
+    in the SimpleMMO API is an absolute Unix timestamp, not a relative
+    countdown, so 'upcoming' means enable_time > now."""
     if now is None:
         now = time.time()
 
     upcoming = [b for b in bosses if (b.get("enable_time") or 0) > now]
-    if not upcoming:
-        return None
+    upcoming.sort(key=lambda b: b.get("enable_time"))
 
-    return min(upcoming, key=lambda b: b.get("enable_time"))
+    return upcoming[:limit]
+
+
+def get_upcoming_worldboss(bosses, now=None):
+    """Returns just the single next boss to spawn, or None. Thin wrapper
+    around get_upcoming_worldbosses() for callers that only need one."""
+    upcoming = get_upcoming_worldbosses(bosses, now, limit=1)
+    return upcoming[0] if upcoming else None
 
 
 def worldboss_incoming_soon(boss, now=None):
@@ -450,10 +530,7 @@ async def check_worldboss():
         enable_time = next_boss.get("enable_time")
         already_notified_for = worldboss_reminder_notified_for.get(boss_id)
 
-        if (
-            worldboss_incoming_soon(next_boss, now)
-            and already_notified_for != enable_time
-        ):
+        if worldboss_incoming_soon(next_boss, now) and already_notified_for != enable_time:
             incoming = next_boss
             worldboss_reminder_notified_for[boss_id] = enable_time
 
@@ -517,6 +594,21 @@ def parse_timestamp(ts_str):
         return ts_str
 
 
+# Discord hard limits for embeds (https://discord.com/developers/docs/resources/message#embed-object-embed-limits).
+# Exceeding these raises an HTTPException when sending the message.
+DISCORD_MAX_EMBED_FIELDS = 25
+DISCORD_MAX_FIELD_VALUE_LENGTH = 1024
+
+
+def _safe_field_value(text, limit=DISCORD_MAX_FIELD_VALUE_LENGTH):
+    """Truncates a field value so it never exceeds Discord's per-field
+    character limit, instead of letting embed.add_field() raise later."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
 def format_unix_relative(unix_ts):
     """Formats a raw Unix timestamp (int/float) as a Discord relative
     timestamp, e.g. 'in 3 hours'. Used for world boss enable_time, which is
@@ -536,7 +628,7 @@ def create_raid_embed(raid):
     locations = raid.get("locations", [])
     embed.add_field(
         name="📍 Locations",
-        value="\n".join(locations) if locations else "Unknown",
+        value=_safe_field_value("\n".join(locations)) if locations else "Unknown",
         inline=False,
     )
 
@@ -574,7 +666,9 @@ def create_orphanage_embed(orphanage):
 
     effects = orphanage.get("effects", [])
     embed.add_field(
-        name="✨ Effects", value="\n".join(effects) if effects else "None", inline=False
+        name="✨ Effects",
+        value=_safe_field_value("\n".join(effects)) if effects else "None",
+        inline=False,
     )
 
     percentage = orphanage.get("percentage", 0)
@@ -719,13 +813,13 @@ def create_guild_task_status_embed(task):
     return embed
 
 
-def create_auth_failure_embed(count):
+def create_auth_failure_embed(count, endpoint):
     embed = discord.Embed(
         title="🚨 API Authentication Failing",
         description=(
             f"The bot has failed to authenticate with the SimpleMMO API "
-            f"{count} times in a row. The API key may be invalid or expired — "
-            f"please check the `.env` configuration."
+            f"on `{endpoint}` {count} times in a row. The API key may be "
+            f"invalid or expired — please check the `.env` configuration."
         ),
         color=0xFF0000,
     )
@@ -756,8 +850,13 @@ async def _monitor_tick():
     channel = bot.get_channel(CHANNEL_ID)
 
     if channel is None:
-        logger.warning(f"Channel {CHANNEL_ID} not found")
-        return
+        # The gateway cache may not have the channel yet (e.g. right after
+        # startup), so fall back to an explicit API fetch before giving up.
+        try:
+            channel = await bot.fetch_channel(CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logger.warning(f"Channel {CHANNEL_ID} not found via cache or fetch: {e}")
+            return
 
     if not isinstance(channel, discord.TextChannel):
         logger.error(
@@ -766,26 +865,33 @@ async def _monitor_tick():
         )
         return
 
-    global raid_reminder_sent, auth_failure_notified, no_raid_logged
+    global raid_reminder_sent, no_raid_logged
 
     raid = await get_raid()
     if raid is not None and not is_valid_raid(raid):
         if not no_raid_logged:
             logger.info("No active raid (empty/placeholder data from API)")
             no_raid_logged = True
+            persist_state()
         raid = None
 
     if raid is not None:
-        no_raid_logged = False
-        if is_new_raid(raid):
+        if no_raid_logged:
+            no_raid_logged = False
+            persist_state()
+
+        if raid_is_new(raid, last_raid_started):
             logger.info("New raid detected, sending notification")
+            commit_raid_seen(raid)
             ping_content = f"<@&{RAID_ROLE_ID}>" if RAID_ROLE_ID else None
             await channel.send(content=ping_content, embed=create_raid_embed(raid))
             raid_reminder_sent = False
+            persist_state()
         elif not raid_reminder_sent and raid_expiring_soon(raid):
             logger.info("Raid expiring soon, sending reminder")
             await channel.send(embed=create_raid_reminder_embed(raid))
             raid_reminder_sent = True
+            persist_state()
 
     orphanage = await check_orphanage()
     if orphanage:
@@ -813,13 +919,16 @@ async def _monitor_tick():
             logger.info("Guild task completed, sending notification")
             await channel.send(embed=create_guild_task_embed(task, completed=True))
 
-    # Warn once if the API key seems to be failing repeatedly.
-    if consecutive_401_count >= AUTH_FAILURE_THRESHOLD and not auth_failure_notified:
-        logger.error(
-            f"{consecutive_401_count} consecutive auth failures, notifying channel"
-        )
-        await channel.send(embed=create_auth_failure_embed(consecutive_401_count))
-        auth_failure_notified = True
+    # Warn once per endpoint if the API key seems to be failing repeatedly
+    # on that specific endpoint (see _handle_response for how counts accrue).
+    for endpoint, count in list(consecutive_401_counts.items()):
+        if count >= AUTH_FAILURE_THRESHOLD and endpoint not in auth_failure_notified_endpoints:
+            logger.error(
+                f"{count} consecutive auth failures on {endpoint}, notifying channel"
+            )
+            await channel.send(embed=create_auth_failure_embed(count, endpoint))
+            auth_failure_notified_endpoints[endpoint] = True
+            persist_state()
 
 
 # ==========================================================
@@ -896,6 +1005,7 @@ async def on_app_command_error(
 
 
 @bot.tree.command(name="raid", description="Show the current guild raid status")
+@discord.app_commands.checks.cooldown(1, 15.0)
 async def raid_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -917,6 +1027,7 @@ async def raid_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="orphanage", description="Show the current orphanage status")
+@discord.app_commands.checks.cooldown(1, 15.0)
 async def orphanage_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -951,6 +1062,7 @@ async def orphanage_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="task", description="Show the current guild task status")
+@discord.app_commands.checks.cooldown(1, 15.0)
 async def task_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -970,6 +1082,7 @@ async def task_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="worldboss", description="Show active world bosses")
+@discord.app_commands.checks.cooldown(1, 15.0)
 async def worldboss_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -991,14 +1104,24 @@ async def worldboss_command(interaction: discord.Interaction):
         )
     else:
         embed = discord.Embed(title="🔥 Active World Bosses", color=0xFF8800)
-        for boss in active_bosses:
+        # Leave room for the "Next World Boss" field below, and stay safely
+        # under Discord's 25-field-per-embed hard limit.
+        max_active_fields = DISCORD_MAX_EMBED_FIELDS - 2
+        for boss in active_bosses[:max_active_fields]:
             hp = boss.get("current_hp", 0)
             max_hp = boss.get("max_hp", 1)
             pct = int(hp / max_hp * 100) if max_hp else 0
             embed.add_field(
                 name=f"{boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
-                value=f"HP: {format_number(hp)} / {format_number(max_hp)} ({pct}%)",
+                value=_safe_field_value(
+                    f"HP: {format_number(hp)} / {format_number(max_hp)} ({pct}%)"
+                ),
                 inline=False,
+            )
+        remaining = len(active_bosses) - max_active_fields
+        if remaining > 0:
+            embed.add_field(
+                name="…", value=f"and {remaining} more active", inline=False
             )
 
     # Always show the next upcoming boss countdown too, if there is one.
@@ -1006,7 +1129,7 @@ async def worldboss_command(interaction: discord.Interaction):
     if next_boss:
         embed.add_field(
             name="⏳ Next World Boss",
-            value=(
+            value=_safe_field_value(
                 f"{next_boss.get('name', 'Unknown')} (Lv. {next_boss.get('level', '?')}) "
                 f"— spawns {format_unix_relative(next_boss.get('enable_time'))}"
             ),
@@ -1015,6 +1138,58 @@ async def worldboss_command(interaction: discord.Interaction):
 
     embed.timestamp = datetime.now(timezone.utc)
 
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(
+    name="nextbosses",
+    description="Show the next world boss(es) about to spawn",
+)
+@discord.app_commands.describe(
+    count="How many upcoming bosses to show (default 1, max 15)"
+)
+@discord.app_commands.checks.cooldown(1, 15.0)
+async def next_bosses_command(
+    interaction: discord.Interaction,
+    count: discord.app_commands.Range[int, 1, 15] = 1,
+):
+    await interaction.response.defer()
+
+    bosses = await get_worldboss()
+
+    if bosses is None:
+        await interaction.followup.send(
+            "⚠️ Couldn't fetch world boss data from the API right now. Check the logs for details."
+        )
+        return
+
+    now = time.time()
+    upcoming = get_upcoming_worldbosses(bosses, now, limit=count)
+
+    if not upcoming:
+        await interaction.followup.send(
+            "ℹ️ No upcoming world boss found in the current API data "
+            "(it may already be active, or the API isn't exposing a next spawn right now)."
+        )
+        return
+
+    if len(upcoming) == 1:
+        await interaction.followup.send(embed=create_worldboss_incoming_embed(upcoming[0]))
+        return
+
+    embed = discord.Embed(
+        title=f"⏳ Upcoming World Bosses ({len(upcoming)})", color=0xFFA500
+    )
+    for boss in upcoming:
+        embed.add_field(
+            name=f"{boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
+            value=_safe_field_value(
+                f"Spawns {format_unix_relative(boss.get('enable_time'))}"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
     await interaction.followup.send(embed=embed)
 
 
@@ -1054,8 +1229,69 @@ async def uptime(interaction: discord.Interaction):
 # START
 # ==========================================================
 
+
+async def _graceful_shutdown(sig=None):
+    """Runs on SIGINT/SIGTERM (e.g. Ctrl+C, or `docker stop` / systemd
+    `systemctl stop`) so the bot exits cleanly instead of dropping the
+    aiohttp session and any in-flight state mid-write."""
+    if sig is not None:
+        logger.info(f"Received {sig.name}, shutting down gracefully")
+
+    if monitor.is_running():
+        monitor.cancel()
+
+    persist_state()
+    await close_session()
+
+    if not bot.is_closed():
+        await bot.close()
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+    shutdown_signal = {}
+
+    def _handle_signal(received_sig):
+        shutdown_signal["sig"] = received_sig
+        shutdown_event.set()
+
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, _handle_signal, sig)
+        except NotImplementedError:
+            # add_signal_handler isn't available on Windows; Ctrl+C still
+            # raises KeyboardInterrupt, which is handled below instead.
+            pass
+
+    async def _run_bot():
+        async with bot:
+            await bot.start(DISCORD_TOKEN)
+
+    bot_task = asyncio.create_task(_run_bot())
+    shutdown_task = asyncio.create_task(shutdown_event.wait())
+
+    done, pending = await asyncio.wait(
+        {bot_task, shutdown_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    if shutdown_task in done:
+        await _graceful_shutdown(shutdown_signal.get("sig"))
+        bot_task.cancel()
+    else:
+        # The bot task ended on its own (e.g. login failure) — clean up too.
+        await _graceful_shutdown()
+
+    for task in pending:
+        task.cancel()
+
+
 if __name__ == "__main__":
     try:
-        bot.run(DISCORD_TOKEN)
-    finally:
-        asyncio.run(close_session())
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # Fallback for platforms where add_signal_handler isn't supported.
+        asyncio.run(_graceful_shutdown())

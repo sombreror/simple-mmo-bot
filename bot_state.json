@@ -21,12 +21,14 @@
     "3751": {
       "active": false,
       "hp": 86241652
-    },
-    "3752": {
-      "active": false,
-      "hp": 75688723
     }
   },
   "last_guild_task_key": "npc:7500",
-  "guild_task_completed_notified": false
+  "guild_task_completed_notified": false,
+  "raid_reminder_sent": true,
+  "no_raid_logged": false,
+  "worldboss_reminder_notified_for": {
+    "3752": 1785527353
+  },
+  "auth_failure_notified_endpoints": {}
 }
