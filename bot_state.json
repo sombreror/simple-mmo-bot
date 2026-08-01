@@ -26,7 +26,7 @@
   "last_guild_task_key": "npc:7500",
   "guild_task_completed_notified": false,
   "raid_reminder_sent": true,
-  "no_raid_logged": false,
+  "no_raid_logged": true,
   "worldboss_reminder_notified_for": {
     "3752": 1785527353
   },
