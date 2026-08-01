@@ -172,7 +172,7 @@ no_raid_logged = _state.get("no_raid_logged", False)  # avoids logging "no activ
 # World boss "incoming soon" reminder: warns once per boss cycle, this many
 # minutes before its enable_time. Keyed by boss_id -> enable_time already
 # notified for, so a new cycle (different enable_time) can be re-notified.
-WORLDBOSS_REMINDER_MINUTES_BEFORE = 60
+WORLDBOSS_REMINDER_MINUTES_BEFORE = 1
 worldboss_reminder_notified_for = _state.get("worldboss_reminder_notified_for", {})  # {boss_id: enable_time}
 
 # Tracks consecutive 401 (auth) failures PER ENDPOINT, so one endpoint
@@ -481,7 +481,11 @@ def worldboss_incoming_soon(boss, now=None):
 
 async def check_worldboss():
     """Returns (activated, killed, incoming):
-    - activated: bosses whose state changed from inactive to active since the last check
+    - activated: bosses whose state changed from inactive to active since the last check.
+      NOTE: this is still tracked/returned for internal state purposes (it's
+      needed to correctly detect the later "killed" transition), but the
+      caller intentionally does NOT send a Discord notification for it — the
+      only "boss is starting" notification is the 1-minute-before "incoming" one.
     - killed: bosses whose state changed from active to dead (hp <= 0) since the last check
     - incoming: the next upcoming boss if it's about to spawn within
       WORLDBOSS_REMINDER_MINUTES_BEFORE minutes and hasn't been notified yet
@@ -898,10 +902,13 @@ async def _monitor_tick():
         logger.info("New orphanage event detected, sending notification")
         await channel.send(embed=create_orphanage_embed(orphanage))
 
-    boss_activated, boss_killed, boss_incoming = await check_worldboss()
-    for boss in boss_activated:
-        logger.info(f"World boss activated: {boss.get('name')}")
-        await channel.send(embed=create_worldboss_embed(boss, killed=False))
+    # NOTE: `boss_activated` is intentionally NOT used to send a "World Boss
+    # Active" notification anymore. The only "boss is starting" notification
+    # is the `boss_incoming` one below, sent WORLDBOSS_REMINDER_MINUTES_BEFORE
+    # minutes before the boss actually spawns. `boss_activated` is still
+    # returned by check_worldboss() because it's needed internally to detect
+    # the "killed" transition correctly.
+    _boss_activated, boss_killed, boss_incoming = await check_worldboss()
     for boss in boss_killed:
         logger.info(f"World boss killed: {boss.get('name')}")
         await channel.send(embed=create_worldboss_embed(boss, killed=True))
