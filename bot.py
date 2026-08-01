@@ -86,9 +86,7 @@ class JsonFormatter(logging.Formatter):
         }
 
         if record.exc_info:
-            payload["exception"] = "".join(
-                traceback.format_exception(*record.exc_info)
-            )
+            payload["exception"] = "".join(traceback.format_exception(*record.exc_info))
 
         return json.dumps(payload, ensure_ascii=False)
 
@@ -101,7 +99,9 @@ _plain_handler_stream.setFormatter(
     logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 )
 
-logging.basicConfig(level=logging.INFO, handlers=[_json_handler_file, _plain_handler_stream])
+logging.basicConfig(
+    level=logging.INFO, handlers=[_json_handler_file, _plain_handler_stream]
+)
 logger = logging.getLogger(__name__)
 
 
@@ -167,13 +167,17 @@ bot_start_time = time.time()
 # restart that happened to land near an event.
 raid_reminder_sent = _state.get("raid_reminder_sent", False)
 RAID_REMINDER_MINUTES_BEFORE = 10  # how long before expiry to warn
-no_raid_logged = _state.get("no_raid_logged", False)  # avoids logging "no active raid" on every single check
+no_raid_logged = _state.get(
+    "no_raid_logged", False
+)  # avoids logging "no active raid" on every single check
 
 # World boss "incoming soon" reminder: warns once per boss cycle, this many
 # minutes before its enable_time. Keyed by boss_id -> enable_time already
 # notified for, so a new cycle (different enable_time) can be re-notified.
 WORLDBOSS_REMINDER_MINUTES_BEFORE = 1
-worldboss_reminder_notified_for = _state.get("worldboss_reminder_notified_for", {})  # {boss_id: enable_time}
+worldboss_reminder_notified_for = _state.get(
+    "worldboss_reminder_notified_for", {}
+)  # {boss_id: enable_time}
 
 # Tracks consecutive 401 (auth) failures PER ENDPOINT, so one endpoint
 # failing repeatedly can't be masked by another endpoint that's still
@@ -183,8 +187,20 @@ worldboss_reminder_notified_for = _state.get("worldboss_reminder_notified_for", 
 consecutive_401_counts = {}  # {endpoint: count}
 # This one IS persisted, so a restart doesn't cause the same ongoing auth
 # failure to be re-announced every time the bot restarts.
-auth_failure_notified_endpoints = _state.get("auth_failure_notified_endpoints", {})  # {endpoint: True}
+auth_failure_notified_endpoints = _state.get(
+    "auth_failure_notified_endpoints", {}
+)  # {endpoint: True}
 AUTH_FAILURE_THRESHOLD = 3
+
+# Guild sanctuary tracking:
+# - last_sanctuary_active: the tier "key" (e.g. "tier_2") that currently has
+#   is_active == true, or None if no tier is active. Used to detect when the
+#   guild switches to a different active tier.
+# - sanctuary_completed_tiers: list of tier "key"s whose goal has already
+#   been reached (percentage >= 100) and already notified about, so we don't
+#   re-notify every tick once a tier stays completed.
+last_sanctuary_active = _state.get("last_sanctuary_active")
+sanctuary_completed_tiers = _state.get("sanctuary_completed_tiers", [])
 
 
 def persist_state():
@@ -199,6 +215,8 @@ def persist_state():
             "no_raid_logged": no_raid_logged,
             "worldboss_reminder_notified_for": worldboss_reminder_notified_for,
             "auth_failure_notified_endpoints": auth_failure_notified_endpoints,
+            "last_sanctuary_active": last_sanctuary_active,
+            "sanctuary_completed_tiers": sanctuary_completed_tiers,
         }
     )
 
@@ -349,6 +367,10 @@ async def get_worldboss():
 
 async def get_guild_task():
     return await smmo_request(f"/v1/guilds/task/{GUILD_ID}")
+
+
+async def get_sanctuary():
+    return await smmo_request(f"/v1/guilds/sanctuary/{GUILD_ID}")
 
 
 # ==========================================================
@@ -534,7 +556,10 @@ async def check_worldboss():
         enable_time = next_boss.get("enable_time")
         already_notified_for = worldboss_reminder_notified_for.get(boss_id)
 
-        if worldboss_incoming_soon(next_boss, now) and already_notified_for != enable_time:
+        if (
+            worldboss_incoming_soon(next_boss, now)
+            and already_notified_for != enable_time
+        ):
             incoming = next_boss
             worldboss_reminder_notified_for[boss_id] = enable_time
 
@@ -580,6 +605,61 @@ async def check_guild_task():
         return ("completed", task)
 
     return None
+
+
+# ==========================================================
+# GUILD SANCTUARY CHECK
+# ==========================================================
+
+
+def _sanctuary_tier_key(tier):
+    return tier.get("tier", {}).get("key")
+
+
+async def check_sanctuary():
+    """Returns (newly_active, newly_completed):
+    - newly_active: the tier dict that just became the active one
+      (is_active flipped to true on a different tier than before), or None
+      if the active tier didn't change.
+    - newly_completed: list of tier dicts whose goal was just reached
+      (percentage >= 100) for the first time, i.e. not already notified.
+    """
+    global last_sanctuary_active, sanctuary_completed_tiers
+
+    tiers = await get_sanctuary()
+    if not tiers:
+        return None, []
+
+    active = None
+    for tier in tiers:
+        if tier.get("is_active"):
+            active = tier
+            break
+
+    active_key = _sanctuary_tier_key(active) if active else None
+
+    newly_active = None
+    if active_key != last_sanctuary_active:
+        last_sanctuary_active = active_key
+        persist_state()
+        if active:
+            newly_active = active
+
+    newly_completed = []
+    for tier in tiers:
+        key = _sanctuary_tier_key(tier)
+        if (
+            key
+            and tier.get("percentage", 0) >= 100
+            and key not in sanctuary_completed_tiers
+        ):
+            sanctuary_completed_tiers.append(key)
+            newly_completed.append(tier)
+
+    if newly_completed:
+        persist_state()
+
+    return newly_active, newly_completed
 
 
 # ==========================================================
@@ -817,6 +897,94 @@ def create_guild_task_status_embed(task):
     return embed
 
 
+def create_sanctuary_active_embed(tier):
+    tier_name = tier.get("tier", {}).get("name", "Unknown Tier")
+
+    embed = discord.Embed(
+        title="🏛️ Sanctuary Tier Active!",
+        description=f"**{tier_name}** is now the active guild sanctuary tier!",
+        color=0x44FF44,
+    )
+
+    effects = tier.get("effects", [])
+    embed.add_field(
+        name="✨ Effects",
+        value=_safe_field_value("\n".join(effects)) if effects else "None",
+        inline=False,
+    )
+
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
+
+    return embed
+
+
+def create_sanctuary_completed_embed(tier):
+    tier_name = tier.get("tier", {}).get("name", "Unknown Tier")
+    current = tier.get("current_value", 0)
+    target = tier.get("target_value", 0)
+
+    embed = discord.Embed(
+        title="🏆 Sanctuary Tier Completed!",
+        description=f"**{tier_name}** has reached its goal!",
+        color=0xFFD700,
+    )
+
+    embed.add_field(name="🎯 Target", value=f"{target:,}", inline=False)
+    embed.add_field(name="📊 Reached", value=f"{current:,} / {target:,}", inline=False)
+
+    effects = tier.get("effects", [])
+    embed.add_field(
+        name="✨ Effects Unlocked",
+        value=_safe_field_value("\n".join(effects)) if effects else "None",
+        inline=False,
+    )
+
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
+
+    return embed
+
+
+def create_sanctuary_status_embed(tiers):
+    embed = discord.Embed(title="🏛️ Guild Sanctuary Status", color=0x4488FF)
+
+    for tier in tiers:
+        tier_name = tier.get("tier", {}).get("name", "Unknown Tier")
+        current = tier.get("current_value", 0)
+        target = tier.get("target_value", 0)
+        pct = tier.get("percentage", 0)
+        bar, _ = _progress_bar(current, target)
+
+        status_bits = []
+        if tier.get("is_active"):
+            status_bits.append("🟢 Active")
+        if tier.get("has_expired"):
+            status_bits.append("⌛ Expired")
+        elif tier.get("in_progress"):
+            status_bits.append("🔨 In progress")
+        elif tier.get("goal_reached_at"):
+            status_bits.append("✅ Goal reached")
+        status = " · ".join(status_bits) if status_bits else "—"
+
+        value_lines = [
+            status,
+            f"{current:,} / {target:,} ({pct}%)",
+            bar,
+        ]
+
+        embed.add_field(
+            name=tier_name,
+            value=_safe_field_value("\n".join(value_lines)),
+            inline=False,
+        )
+
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
+
+    return embed
+
+
 def create_auth_failure_embed(count, endpoint):
     embed = discord.Embed(
         title="🚨 API Authentication Failing",
@@ -926,10 +1094,23 @@ async def _monitor_tick():
             logger.info("Guild task completed, sending notification")
             await channel.send(embed=create_guild_task_embed(task, completed=True))
 
+    sanctuary_active, sanctuary_completed = await check_sanctuary()
+    if sanctuary_active:
+        logger.info(
+            f"Sanctuary tier became active: {sanctuary_active.get('tier', {}).get('name')}"
+        )
+        await channel.send(embed=create_sanctuary_active_embed(sanctuary_active))
+    for tier in sanctuary_completed:
+        logger.info(f"Sanctuary tier goal reached: {tier.get('tier', {}).get('name')}")
+        await channel.send(embed=create_sanctuary_completed_embed(tier))
+
     # Warn once per endpoint if the API key seems to be failing repeatedly
     # on that specific endpoint (see _handle_response for how counts accrue).
     for endpoint, count in list(consecutive_401_counts.items()):
-        if count >= AUTH_FAILURE_THRESHOLD and endpoint not in auth_failure_notified_endpoints:
+        if (
+            count >= AUTH_FAILURE_THRESHOLD
+            and endpoint not in auth_failure_notified_endpoints
+        ):
             logger.error(
                 f"{count} consecutive auth failures on {endpoint}, notifying channel"
             )
@@ -1068,6 +1249,24 @@ async def orphanage_command(interaction: discord.Interaction):
     await interaction.followup.send(embed=create_orphanage_embed(active))
 
 
+@bot.tree.command(
+    name="sanctuary", description="Show the current guild sanctuary status"
+)
+@discord.app_commands.checks.cooldown(1, 15.0)
+async def sanctuary_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    tiers = await get_sanctuary()
+
+    if not tiers:
+        await interaction.followup.send(
+            "⚠️ Couldn't fetch sanctuary data from the API right now. Check the logs for details."
+        )
+        return
+
+    await interaction.followup.send(embed=create_sanctuary_status_embed(tiers))
+
+
 @bot.tree.command(name="task", description="Show the current guild task status")
 @discord.app_commands.checks.cooldown(1, 15.0)
 async def task_command(interaction: discord.Interaction):
@@ -1181,7 +1380,9 @@ async def next_bosses_command(
         return
 
     if len(upcoming) == 1:
-        await interaction.followup.send(embed=create_worldboss_incoming_embed(upcoming[0]))
+        await interaction.followup.send(
+            embed=create_worldboss_incoming_embed(upcoming[0])
+        )
         return
 
     embed = discord.Embed(
