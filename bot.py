@@ -23,7 +23,6 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 API_KEY = os.getenv("API_KEY")
-CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
 GUILD_ID_RAW = os.getenv("GUILD_ID")
 RAID_ROLE_ID_RAW = os.getenv("RAID_ROLE_ID")  # optional: role to ping on raids
 
@@ -37,14 +36,6 @@ if API_KEY is None:
     errors.append("API_KEY missing in .env")
 else:
     API_KEY = API_KEY.strip()  # remove accidental spaces/newlines
-
-if CHANNEL_ID_RAW is None:
-    errors.append("CHANNEL_ID missing in .env")
-else:
-    try:
-        CHANNEL_ID = int(CHANNEL_ID_RAW)
-    except ValueError:
-        errors.append(f"CHANNEL_ID must be a valid integer, got: {CHANNEL_ID_RAW!r}")
 
 if GUILD_ID_RAW is None:
     errors.append("GUILD_ID missing in .env")
@@ -80,9 +71,15 @@ def _parse_optional_channel_id(env_var_name):
         return None
 
 
-# Per-feature notification channels. Each one is optional: if not set in
-# .env, it falls back to the main CHANNEL_ID, so the bot keeps working with
-# a single channel until you're ready to split some or all of these out.
+# CHANNEL_ID is now OPTIONAL: it used to be the single mandatory channel,
+# but now it only acts as a shared fallback for any per-feature channel
+# below that you haven't split out yet. What's actually required is that
+# EVERY feature ends up with *some* valid channel — either its own specific
+# *_CHANNEL_ID, or this fallback — checked explicitly further down.
+CHANNEL_ID = _parse_optional_channel_id("CHANNEL_ID")
+
+# Per-feature notification channels. Each one falls back to CHANNEL_ID if
+# not set individually, so you can split them out one at a time.
 RAID_CHANNEL_ID = _parse_optional_channel_id("RAID_CHANNEL_ID") or CHANNEL_ID
 WORLDBOSS_CHANNEL_ID = _parse_optional_channel_id("WORLDBOSS_CHANNEL_ID") or CHANNEL_ID
 ORPHANAGE_CHANNEL_ID = _parse_optional_channel_id("ORPHANAGE_CHANNEL_ID") or CHANNEL_ID
@@ -94,6 +91,27 @@ ERROR_ALERT_CHANNEL_ID = _parse_optional_channel_id("ERROR_ALERT_CHANNEL_ID") or
 # restriction", i.e. slash commands can be used anywhere the bot has
 # access, which is the same behavior as before this feature existed.
 COMMANDS_CHANNEL_ID = _parse_optional_channel_id("COMMANDS_CHANNEL_ID")
+
+# Now that every per-feature channel has had a chance to fall back to
+# CHANNEL_ID, make sure each one actually ended up with SOMETHING. A
+# feature left with None here means neither its own specific env var nor
+# the general CHANNEL_ID fallback was set — that's a real misconfiguration,
+# reported with the exact variable name so it's obvious what to add.
+_required_channels = {
+    "RAID_CHANNEL_ID": RAID_CHANNEL_ID,
+    "WORLDBOSS_CHANNEL_ID": WORLDBOSS_CHANNEL_ID,
+    "ORPHANAGE_CHANNEL_ID": ORPHANAGE_CHANNEL_ID,
+    "GUILD_TASK_CHANNEL_ID": GUILD_TASK_CHANNEL_ID,
+    "SANCTUARY_CHANNEL_ID": SANCTUARY_CHANNEL_ID,
+    "ERROR_ALERT_CHANNEL_ID": ERROR_ALERT_CHANNEL_ID,
+}
+_channel_errors = [
+    f"{name} missing: set {name} specifically, or set the general CHANNEL_ID as a fallback"
+    for name, value in _required_channels.items()
+    if value is None
+]
+if _channel_errors:
+    raise ValueError("\n".join(_channel_errors))
 
 
 # ==========================================================
@@ -181,14 +199,35 @@ async def resolve_notification_channels(channel_ids):
     return resolved
 
 
-async def send_to_channel(channels, channel_id, **kwargs):
-    """Sends a message via the pre-resolved `channels` dict, silently
-    skipping (with the warning already logged by resolve_notification_channels)
-    if that particular channel wasn't available this tick."""
+async def send_notification(channels, channel_id, expire_at=None, expire_seconds=None, **kwargs):
+    """Sends a one-off event notification (content/embed via **kwargs, same
+    as channel.send) to a pre-resolved channel from the `channels` dict,
+    silently skipping if that channel wasn't available this tick (already
+    logged by resolve_notification_channels). If `expire_at` (unix
+    timestamp) or `expire_seconds` (relative to now) is given, the message
+    is automatically deleted once that time passes (checked once per
+    monitor tick — see cleanup_expired_notifications). Neither given means
+    it's never auto-deleted (used for things like the auth-failure alert,
+    which should stick around until a human deals with it)."""
     channel = channels.get(channel_id)
     if channel is None:
         return
-    await channel.send(**kwargs)
+
+    try:
+        message = await channel.send(**kwargs)
+    except discord.HTTPException as e:
+        logger.warning(f"Failed to send notification to channel {channel_id}: {e}")
+        return
+
+    if expire_at is None and expire_seconds is not None:
+        expire_at = time.time() + expire_seconds
+
+    if expire_at is not None:
+        global pending_notification_deletions
+        pending_notification_deletions.append(
+            {"channel_id": channel_id, "message_id": message.id, "expires_at": expire_at}
+        )
+        persist_state()
 
 
 # ==========================================================
@@ -291,6 +330,27 @@ AUTH_FAILURE_THRESHOLD = 3
 last_sanctuary_active = _state.get("last_sanctuary_active")
 sanctuary_completed_tiers = _state.get("sanctuary_completed_tiers", [])
 
+# Persistent "status" message tracking: one message per feature, edited in
+# place every tick instead of spamming a new message each time. Keyed by a
+# short feature name -> {"channel_id": ..., "message_id": ...}. Persisted so
+# a restart keeps editing the SAME message instead of creating a new one.
+status_message_ids = _state.get("status_message_ids", {})
+
+# Transient event notifications (new raid, tier activated, boss killed...)
+# that should be auto-deleted once they're no longer relevant, instead of
+# accumulating forever. Each entry: {"channel_id", "message_id", "expires_at"}.
+# Checked/cleaned up once per monitor tick. Persisted so scheduled
+# deletions survive a bot restart instead of being forgotten.
+pending_notification_deletions = _state.get("pending_notification_deletions", [])
+
+# Default lifetime for notifications that have no natural "this is no
+# longer relevant" moment to key off of (e.g. "tier activated" — unlike a
+# raid's expires_at or a boss's enable_time, there's no API field telling
+# us when that announcement stops being useful). Chosen long enough that
+# people reading the channel occasionally will still see it, short enough
+# that channels don't fill up with month-old announcements.
+DEFAULT_NOTIFICATION_LIFETIME_SECONDS = 6 * 60 * 60  # 6 hours
+
 
 def persist_state():
     save_state(
@@ -306,8 +366,94 @@ def persist_state():
             "auth_failure_notified_endpoints": auth_failure_notified_endpoints,
             "last_sanctuary_active": last_sanctuary_active,
             "sanctuary_completed_tiers": sanctuary_completed_tiers,
+            "status_message_ids": status_message_ids,
+            "pending_notification_deletions": pending_notification_deletions,
         }
     )
+
+
+# ==========================================================
+# STATUS MESSAGES & NOTIFICATION LIFECYCLE
+# ==========================================================
+#
+# Two distinct kinds of channel message, used together for every feature:
+#
+# 1. STATUS message: exactly one per feature per channel, edited in place
+#    every tick to always reflect the current full state (all tiers, all
+#    active bosses, etc.) — never re-sent, so it doesn't spam the channel.
+# 2. NOTIFICATION message: sent once when something actually happens (new
+#    raid, tier activated, boss killed...). These are meant to be seen and
+#    then fade away, so they're auto-deleted once they stop being relevant
+#    (see send_notification's expire_at/expire_seconds).
+
+
+async def upsert_status_message(channels, channel_id, feature_key, embed):
+    """Sends the persistent status embed for `feature_key` the first time,
+    then edits that SAME message on every subsequent call. If the stored
+    message was deleted out-of-band (manually, channel purge, etc.) or its
+    channel changed, transparently sends a fresh one instead."""
+    channel = channels.get(channel_id)
+    if channel is None:
+        return
+
+    global status_message_ids
+    info = status_message_ids.get(feature_key)
+
+    if info and info.get("channel_id") == channel_id:
+        try:
+            message = await channel.fetch_message(info["message_id"])
+            await message.edit(embed=embed)
+            return
+        except discord.NotFound:
+            pass  # message is gone — fall through and recreate it below
+        except discord.HTTPException as e:
+            logger.warning(f"Failed to edit '{feature_key}' status message: {e}")
+            return
+
+    try:
+        message = await channel.send(embed=embed)
+    except discord.HTTPException as e:
+        logger.warning(f"Failed to send '{feature_key}' status message: {e}")
+        return
+
+    status_message_ids[feature_key] = {"channel_id": channel_id, "message_id": message.id}
+    persist_state()
+
+
+async def cleanup_expired_notifications(channels):
+    """Deletes any notification messages whose expiry has passed. Entries
+    for channels that aren't resolvable this tick, or where deletion fails
+    for a transient reason, are kept and retried on the next tick instead
+    of being dropped."""
+    global pending_notification_deletions
+    if not pending_notification_deletions:
+        return
+
+    now = time.time()
+    remaining = []
+
+    for entry in pending_notification_deletions:
+        if entry["expires_at"] > now:
+            remaining.append(entry)
+            continue
+
+        channel = channels.get(entry["channel_id"])
+        if channel is None:
+            remaining.append(entry)  # retry next tick
+            continue
+
+        try:
+            message = await channel.fetch_message(entry["message_id"])
+            await message.delete()
+        except discord.NotFound:
+            pass  # already gone (deleted manually, or channel purged) — fine
+        except discord.HTTPException as e:
+            logger.warning(f"Failed to delete expired notification: {e}")
+            remaining.append(entry)  # retry later
+
+    if remaining != pending_notification_deletions:
+        pending_notification_deletions = remaining
+        persist_state()
 
 
 # ==========================================================
@@ -516,11 +662,19 @@ def raid_expiring_soon(raid):
 
 
 async def check_orphanage():
+    """Returns (newly_active, all_tiers):
+    - newly_active: the tier dict that just became the active one (its
+      identity changed since last check — NOT re-triggered just because its
+      percentage moved, that was a bug: notifying on every progress tick),
+      or None if the active tier didn't change this time.
+    - all_tiers: the full raw tier list from the API (for building the
+      always-up-to-date status embed), or None if the API call failed.
+    """
     global last_orphanage
 
     data = await get_orphanage()
     if data is None:
-        return None
+        return None, None
 
     active = None
     for tier in data:
@@ -528,18 +682,17 @@ async def check_orphanage():
             active = tier
             break
 
-    active_key = None
-    if active:
-        tier_name = active.get("tier", {}).get("name", "")
-        percentage = active.get("percentage", 0)
-        active_key = f"{tier_name}:{percentage}"
+    # Keyed ONLY by tier identity, not percentage — percentage changes
+    # constantly as the guild progresses and must not re-trigger this.
+    active_key = active.get("tier", {}).get("name") if active else None
 
+    newly_active = None
     if active_key != last_orphanage:
         last_orphanage = active_key
         persist_state()
-        return active
+        newly_active = active
 
-    return None
+    return newly_active, data
 
 
 # ==========================================================
@@ -591,7 +744,7 @@ def worldboss_incoming_soon(boss, now=None):
 
 
 async def check_worldboss():
-    """Returns (activated, killed, incoming):
+    """Returns (activated, killed, incoming, bosses):
     - activated: bosses whose state changed from inactive to active since the last check.
       NOTE: this is still tracked/returned for internal state purposes (it's
       needed to correctly detect the later "killed" transition), but the
@@ -601,12 +754,14 @@ async def check_worldboss():
     - incoming: the next upcoming boss if it's about to spawn within
       WORLDBOSS_REMINDER_SECONDS_BEFORE seconds and hasn't been notified yet
       for this specific enable_time, otherwise None
+    - bosses: the full raw boss list from the API (for the always-up-to-date
+      status embed), or None if the API call failed this tick.
     """
     global last_worldboss, worldboss_reminder_notified_for
 
     bosses = await get_worldboss()
     if not bosses:
-        return [], [], None
+        return [], [], None, None
 
     now = time.time()
     new_state = {}
@@ -649,7 +804,7 @@ async def check_worldboss():
             incoming = next_boss
             worldboss_reminder_notified_for[boss_id] = enable_time
 
-    return activated, killed, incoming
+    return activated, killed, incoming, bosses
 
 
 # ==========================================================
@@ -666,13 +821,23 @@ def is_valid_guild_task(task):
 
 
 async def check_guild_task():
-    """Returns ('new', task) if it's a new task, ('completed', task) if the
-    current one was just completed, otherwise None."""
+    """Returns (event, task):
+    - event: ('new', task) if it's a new task, ('completed', task) if the
+      current one was just completed, otherwise None.
+    - task: the raw task dict from the API (even if it's not a "valid"
+      task, e.g. an empty placeholder — the status embed still wants to
+      show "no active task" for that), or None only if the API call itself
+      failed this tick (so the caller can skip updating the status embed
+      and leave the last known one intact instead of showing an error).
+    """
     global last_guild_task_key, guild_task_completed_notified
 
     task = await get_guild_task()
+    if task is None:
+        return None, None
+
     if not is_valid_guild_task(task):
-        return None
+        return None, task
 
     task_type = task.get("type")
     target = task.get("target_amount")
@@ -683,14 +848,14 @@ async def check_guild_task():
         last_guild_task_key = key
         guild_task_completed_notified = False
         persist_state()
-        return ("new", task)
+        return ("new", task), task
 
     if current >= target and not guild_task_completed_notified:
         guild_task_completed_notified = True
         persist_state()
-        return ("completed", task)
+        return ("completed", task), task
 
-    return None
+    return None, task
 
 
 # ==========================================================
@@ -703,18 +868,20 @@ def _sanctuary_tier_key(tier):
 
 
 async def check_sanctuary():
-    """Returns (newly_active, newly_completed):
+    """Returns (newly_active, newly_completed, tiers):
     - newly_active: the tier dict that just became the active one
       (is_active flipped to true on a different tier than before), or None
       if the active tier didn't change.
     - newly_completed: list of tier dicts whose goal was just reached
       (percentage >= 100) for the first time, i.e. not already notified.
+    - tiers: the full raw tier list from the API (for the always-up-to-date
+      status embed), or None if the API call failed this tick.
     """
     global last_sanctuary_active, sanctuary_completed_tiers
 
     tiers = await get_sanctuary()
     if not tiers:
-        return None, []
+        return None, [], None
 
     active = None
     for tier in tiers:
@@ -741,7 +908,7 @@ async def check_sanctuary():
     if newly_completed:
         persist_state()
 
-    return newly_active, newly_completed
+    return newly_active, newly_completed, tiers
 
 
 # ==========================================================
@@ -750,14 +917,31 @@ async def check_sanctuary():
 
 
 def parse_timestamp(ts_str):
+    """Formats an ISO-8601 timestamp as a Discord dynamic timestamp,
+    combining the exact date/time (style 'f') with the relative countdown
+    (style 'R') — e.g. 'June 18, 2026 3:53 PM (in 3 hours)'. Both styles are
+    rendered client-side by Discord, so every reader sees the exact time
+    already converted to THEIR OWN local timezone automatically — no need
+    for the bot to know or guess where anyone is."""
     if not ts_str:
         return "Unknown"
     try:
         dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
         unix_ts = int(dt.timestamp())
-        return f"<t:{unix_ts}:R>"
+        return f"<t:{unix_ts}:f> (<t:{unix_ts}:R>)"
     except ValueError:
         return ts_str
+
+
+def _iso_to_unix(iso_str):
+    """Parses an API ISO-8601 timestamp (e.g. raid started_at/expires_at) to
+    a unix timestamp, or None if it's missing/unparseable."""
+    if not iso_str:
+        return None
+    try:
+        return datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 # Discord hard limits for embeds (https://discord.com/developers/docs/resources/message#embed-object-embed-limits).
@@ -784,6 +968,39 @@ def format_unix_relative(unix_ts):
     return f"<t:{int(unix_ts)}:R>"
 
 
+def _format_duration(seconds):
+    """Formats a duration in seconds as e.g. '8h', '1h 30m', '45m' — used
+    for the raid's total duration (expires_at - started_at)."""
+    seconds = int(seconds or 0)
+    if seconds <= 0:
+        return "Unknown"
+
+    hours, remainder = divmod(seconds, 3600)
+    minutes = remainder // 60
+
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
+def _raid_duration_field_value(raid):
+    """Builds the combined 'started + total duration' field value shared by
+    the raid-started notification and the persistent raid status."""
+    started_at = raid.get("started_at")
+    expires_at = raid.get("expires_at")
+
+    lines = [f"🕐 Started: {parse_timestamp(started_at)}"]
+
+    started_ts = _iso_to_unix(started_at)
+    expires_ts = _iso_to_unix(expires_at)
+    if started_ts is not None and expires_ts is not None:
+        lines.append(f"⏳ Duration: {_format_duration(expires_ts - started_ts)}")
+
+    return "\n".join(lines)
+
+
 def create_raid_embed(raid):
     embed = discord.Embed(
         title="⚔️ Raid Started!",
@@ -797,6 +1014,8 @@ def create_raid_embed(raid):
         value=_safe_field_value("\n".join(locations)) if locations else "Unknown",
         inline=False,
     )
+
+    embed.add_field(name="🗓️ Timing", value=_raid_duration_field_value(raid), inline=False)
 
     expires = raid.get("expires_at")
     embed.add_field(name="⏰ Expires", value=parse_timestamp(expires), inline=False)
@@ -821,6 +1040,34 @@ def create_raid_reminder_embed(raid):
     return embed
 
 
+def create_raid_status_embed(raid):
+    """Always-current raid status, for the persistent status message (as
+    opposed to create_raid_embed/create_raid_reminder_embed, which are for
+    one-off event notifications)."""
+    if raid is None or not is_valid_raid(raid):
+        embed = discord.Embed(
+            title="⚔️ Raid Status",
+            description="ℹ️ No active guild raid right now.",
+            color=0x888888,
+        )
+    else:
+        embed = discord.Embed(title="⚔️ Raid Status", color=0xFF4444)
+        locations = raid.get("locations", [])
+        embed.add_field(
+            name="📍 Locations",
+            value=_safe_field_value("\n".join(locations)) if locations else "Unknown",
+            inline=False,
+        )
+        embed.add_field(name="🗓️ Timing", value=_raid_duration_field_value(raid), inline=False)
+        embed.add_field(
+            name="⏰ Expires", value=parse_timestamp(raid.get("expires_at")), inline=False
+        )
+
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
+
+
 def create_orphanage_embed(orphanage):
     tier_name = orphanage.get("tier", {}).get("name", "Unknown Tier")
 
@@ -837,8 +1084,79 @@ def create_orphanage_embed(orphanage):
         inline=False,
     )
 
+    current = orphanage.get("current_value", 0)
+    target = orphanage.get("target_value", 0)
+    remaining = orphanage.get("target_remaining", max(target - current, 0))
     percentage = orphanage.get("percentage", 0)
-    embed.add_field(name="📊 Progress", value=f"{percentage}%", inline=False)
+    embed.add_field(
+        name="📊 Progress",
+        value=f"{format_number(current)} / {format_number(target)} ({percentage}%)\n"
+        f"{format_number(remaining)} remaining",
+        inline=False,
+    )
+
+    embed.set_footer(text="SimpleMMO Monitor")
+    embed.timestamp = datetime.now(timezone.utc)
+
+    return embed
+
+
+def create_orphanage_status_embed(tiers):
+    """Always-current status of ALL orphanage tiers, for the persistent
+    status message — similar in spirit to Simple Wolf's own orphanage
+    status message (per-tier progress bars, absolute amounts remaining,
+    rewards, and currently active bonuses)."""
+    embed = discord.Embed(title="🏠 Orphanage Status", color=0x44FF44)
+
+    active_effects = []
+
+    for tier in tiers:
+        tier_name = tier.get("tier", {}).get("name", "Unknown Tier")
+        current = tier.get("current_value", 0)
+        target = tier.get("target_value", 0)
+        remaining = tier.get("target_remaining", max(target - current, 0))
+        percentage = tier.get("percentage", 0)
+        effects = tier.get("effects", [])
+        is_active = tier.get("is_active", False)
+
+        if is_active:
+            status_icon = "🟢"
+            status_label = "Active"
+            active_effects = effects
+        elif tier.get("has_expired"):
+            status_icon = "⌛"
+            status_label = "Expired"
+        elif percentage >= 100 or tier.get("goal_reached_at"):
+            status_icon = "✅"
+            status_label = "Goal Reached"
+        elif tier.get("in_progress"):
+            status_icon = "🔻"
+            status_label = "In Progress"
+        else:
+            status_icon = "⚙️"
+            status_label = "Not Started"
+
+        bar, _ = _progress_bar(current, target)
+        value_lines = [
+            f"**{status_label}**",
+            f"{bar} {percentage}%",
+            f"{format_number(current)} of {format_number(target)} "
+            f"({format_number(remaining)} remaining)",
+        ]
+        if effects:
+            value_lines.append("Rewards: " + ", ".join(effects))
+
+        embed.add_field(
+            name=f"{status_icon} {tier_name}",
+            value=_safe_field_value("\n".join(value_lines)),
+            inline=False,
+        )
+
+    embed.add_field(
+        name="✨ Current Active Bonuses",
+        value=_safe_field_value("\n".join(active_effects)) if active_effects else "None",
+        inline=False,
+    )
 
     embed.set_footer(text="SimpleMMO Monitor")
     embed.timestamp = datetime.now(timezone.utc)
@@ -977,6 +1295,24 @@ def create_guild_task_status_embed(task):
     embed.timestamp = datetime.now(timezone.utc)
 
     return embed
+
+
+def create_guild_task_status_embed_safe(task):
+    """Same as create_guild_task_status_embed, but also handles the "no
+    active task right now" case — used by the persistent status message,
+    which (unlike the /task command) must always produce *something* to
+    display rather than an error message."""
+    if not is_valid_guild_task(task):
+        embed = discord.Embed(
+            title="📋 Guild Task Status",
+            description="ℹ️ No active guild task right now.",
+            color=0x888888,
+        )
+        embed.set_footer(text="SimpleMMO Monitor")
+        embed.timestamp = datetime.now(timezone.utc)
+        return embed
+
+    return create_guild_task_status_embed(task)
 
 
 def create_sanctuary_active_embed(tier):
@@ -1119,9 +1455,13 @@ async def _monitor_tick():
         logger.warning("No notification channels could be resolved this tick")
         return
 
+    await cleanup_expired_notifications(channels)
+
     global raid_reminder_sent, no_raid_logged
 
-    raid = await get_raid()
+    raw_raid = await get_raid()
+    raid_fetch_ok = raw_raid is not None
+    raid = raw_raid
     if raid is not None and not is_valid_raid(raid):
         if not no_raid_logged:
             logger.info("No active raid (empty/placeholder data from API)")
@@ -1138,24 +1478,50 @@ async def _monitor_tick():
             logger.info("New raid detected, sending notification")
             commit_raid_seen(raid)
             ping_content = f"<@&{RAID_ROLE_ID}>" if RAID_ROLE_ID else None
-            await send_to_channel(
-                channels, RAID_CHANNEL_ID, content=ping_content, embed=create_raid_embed(raid)
+            raid_expire_at = _iso_to_unix(raid.get("expires_at"))
+            await send_notification(
+                channels,
+                RAID_CHANNEL_ID,
+                content=ping_content,
+                embed=create_raid_embed(raid),
+                expire_at=raid_expire_at,
+                expire_seconds=None if raid_expire_at else DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
             )
             raid_reminder_sent = False
             persist_state()
         elif not raid_reminder_sent and raid_expiring_soon(raid):
             logger.info("Raid expiring soon, sending reminder")
-            await send_to_channel(
-                channels, RAID_CHANNEL_ID, embed=create_raid_reminder_embed(raid)
+            raid_expire_at = _iso_to_unix(raid.get("expires_at"))
+            await send_notification(
+                channels,
+                RAID_CHANNEL_ID,
+                embed=create_raid_reminder_embed(raid),
+                expire_at=raid_expire_at,
+                expire_seconds=None if raid_expire_at else DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
             )
             raid_reminder_sent = True
             persist_state()
 
-    orphanage = await check_orphanage()
-    if orphanage:
-        logger.info("New orphanage event detected, sending notification")
-        await send_to_channel(
-            channels, ORPHANAGE_CHANNEL_ID, embed=create_orphanage_embed(orphanage)
+    if raid_fetch_ok:
+        await upsert_status_message(
+            channels, RAID_CHANNEL_ID, "raid", create_raid_status_embed(raid)
+        )
+
+    newly_active_orphanage, orphanage_tiers = await check_orphanage()
+    if newly_active_orphanage:
+        logger.info("New orphanage tier active, sending notification")
+        await send_notification(
+            channels,
+            ORPHANAGE_CHANNEL_ID,
+            embed=create_orphanage_embed(newly_active_orphanage),
+            expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
+        )
+    if orphanage_tiers is not None:
+        await upsert_status_message(
+            channels,
+            ORPHANAGE_CHANNEL_ID,
+            "orphanage",
+            create_orphanage_status_embed(orphanage_tiers),
         )
 
     # NOTE: `boss_activated` is intentionally NOT used to send a "World Boss
@@ -1164,56 +1530,97 @@ async def _monitor_tick():
     # seconds before the boss actually spawns. `boss_activated` is still
     # returned by check_worldboss() because it's needed internally to detect
     # the "killed" transition correctly.
-    _boss_activated, boss_killed, boss_incoming = await check_worldboss()
+    _boss_activated, boss_killed, boss_incoming, bosses = await check_worldboss()
     for boss in boss_killed:
         logger.info(f"World boss killed: {boss.get('name')}")
-        await send_to_channel(
-            channels, WORLDBOSS_CHANNEL_ID, embed=create_worldboss_embed(boss, killed=True)
+        await send_notification(
+            channels,
+            WORLDBOSS_CHANNEL_ID,
+            embed=create_worldboss_embed(boss, killed=True),
+            expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
         )
     if boss_incoming:
         logger.info(f"World boss incoming soon: {boss_incoming.get('name')}")
-        await send_to_channel(
-            channels, WORLDBOSS_CHANNEL_ID, embed=create_worldboss_incoming_embed(boss_incoming)
+        # Expires the moment the boss actually spawns — by then the
+        # "incoming" heads-up is no longer useful info.
+        await send_notification(
+            channels,
+            WORLDBOSS_CHANNEL_ID,
+            embed=create_worldboss_incoming_embed(boss_incoming),
+            expire_at=boss_incoming.get("enable_time"),
+        )
+    if bosses is not None:
+        await upsert_status_message(
+            channels, WORLDBOSS_CHANNEL_ID, "worldboss", create_worldboss_status_embed(bosses)
         )
 
-    task_event = await check_guild_task()
+    task_event, task = await check_guild_task()
     if task_event:
-        event_type, task = task_event
+        event_type, event_task = task_event
         if event_type == "new":
             logger.info("New guild task detected, sending notification")
-            await send_to_channel(
-                channels, GUILD_TASK_CHANNEL_ID, embed=create_guild_task_embed(task, completed=False)
+            await send_notification(
+                channels,
+                GUILD_TASK_CHANNEL_ID,
+                embed=create_guild_task_embed(event_task, completed=False),
+                expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
             )
         elif event_type == "completed":
             logger.info("Guild task completed, sending notification")
-            await send_to_channel(
-                channels, GUILD_TASK_CHANNEL_ID, embed=create_guild_task_embed(task, completed=True)
+            await send_notification(
+                channels,
+                GUILD_TASK_CHANNEL_ID,
+                embed=create_guild_task_embed(event_task, completed=True),
+                expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
             )
+    if task is not None:
+        await upsert_status_message(
+            channels,
+            GUILD_TASK_CHANNEL_ID,
+            "guild_task",
+            create_guild_task_status_embed_safe(task),
+        )
 
-    sanctuary_active, sanctuary_completed = await check_sanctuary()
+    sanctuary_active, sanctuary_completed, sanctuary_tiers = await check_sanctuary()
     if sanctuary_active:
         logger.info(
             f"Sanctuary tier became active: {sanctuary_active.get('tier', {}).get('name')}"
         )
-        await send_to_channel(
-            channels, SANCTUARY_CHANNEL_ID, embed=create_sanctuary_active_embed(sanctuary_active)
+        await send_notification(
+            channels,
+            SANCTUARY_CHANNEL_ID,
+            embed=create_sanctuary_active_embed(sanctuary_active),
+            expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
         )
     for tier in sanctuary_completed:
         logger.info(
             f"Sanctuary tier goal reached: {tier.get('tier', {}).get('name')}"
         )
-        await send_to_channel(
-            channels, SANCTUARY_CHANNEL_ID, embed=create_sanctuary_completed_embed(tier)
+        await send_notification(
+            channels,
+            SANCTUARY_CHANNEL_ID,
+            embed=create_sanctuary_completed_embed(tier),
+            expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
+        )
+    if sanctuary_tiers is not None:
+        await upsert_status_message(
+            channels,
+            SANCTUARY_CHANNEL_ID,
+            "sanctuary",
+            create_sanctuary_status_embed(sanctuary_tiers),
         )
 
     # Warn once per endpoint if the API key seems to be failing repeatedly
     # on that specific endpoint (see _handle_response for how counts accrue).
+    # NOTE: intentionally no expire_at/expire_seconds here — this is an
+    # operational alert, not a game event, so it should stick around until
+    # a human notices and fixes the API key rather than quietly vanishing.
     for endpoint, count in list(consecutive_401_counts.items()):
         if count >= AUTH_FAILURE_THRESHOLD and endpoint not in auth_failure_notified_endpoints:
             logger.error(
                 f"{count} consecutive auth failures on {endpoint}, notifying channel"
             )
-            await send_to_channel(
+            await send_notification(
                 channels, ERROR_ALERT_CHANNEL_ID, embed=create_auth_failure_embed(count, endpoint)
             )
             auth_failure_notified_endpoints[endpoint] = True
@@ -1303,7 +1710,7 @@ async def _restrict_commands_to_channel(interaction: discord.Interaction) -> boo
         return True
 
     await interaction.response.send_message(
-        f"🚫 Usa questo comando in <#{COMMANDS_CHANNEL_ID}>.", ephemeral=True
+        f"🚫 Use this command in <#{COMMANDS_CHANNEL_ID}>.", ephemeral=True
     )
     return False
 
@@ -1404,20 +1811,13 @@ async def task_command(interaction: discord.Interaction):
     await interaction.followup.send(embed=create_guild_task_status_embed(task))
 
 
-@bot.tree.command(name="worldboss", description="Show active world bosses")
-@discord.app_commands.checks.cooldown(1, 15.0)
-async def worldboss_command(interaction: discord.Interaction):
-    await interaction.response.defer()
+def create_worldboss_status_embed(bosses, now=None):
+    """Always-current status of world bosses (active ones + next upcoming
+    spawn), shared by both the /worldboss command and the persistent status
+    message so the two never drift apart."""
+    if now is None:
+        now = time.time()
 
-    bosses = await get_worldboss()
-
-    if bosses is None:
-        await interaction.followup.send(
-            "⚠️ Couldn't fetch world boss data from the API right now. Check the logs for details."
-        )
-        return
-
-    now = time.time()
     active_bosses = [b for b in bosses if is_boss_active(b, now)]
 
     if not active_bosses:
@@ -1459,8 +1859,26 @@ async def worldboss_command(interaction: discord.Interaction):
             inline=False,
         )
 
+    embed.set_footer(text="SimpleMMO Monitor")
     embed.timestamp = datetime.now(timezone.utc)
 
+    return embed
+
+
+@bot.tree.command(name="worldboss", description="Show active world bosses")
+@discord.app_commands.checks.cooldown(1, 15.0)
+async def worldboss_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    bosses = await get_worldboss()
+
+    if bosses is None:
+        await interaction.followup.send(
+            "⚠️ Couldn't fetch world boss data from the API right now. Check the logs for details."
+        )
+        return
+
+    embed = create_worldboss_status_embed(bosses)
     await interaction.followup.send(embed=embed)
 
 

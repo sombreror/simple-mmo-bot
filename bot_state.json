@@ -3,8 +3,8 @@
   "last_orphanage": null,
   "last_worldboss": {
     "3748": {
-      "active": false,
-      "hp": 60255329
+      "active": true,
+      "hp": 19341458
     }
   },
   "last_guild_task_key": "npc:7500",
@@ -15,12 +15,32 @@
     "3752": 1785527353,
     "3742": 1785594386,
     "3749": 1785595105,
-    "3747": 1785615289
+    "3747": 1785615289,
+    "3748": 1785701296
   },
   "auth_failure_notified_endpoints": {},
   "last_sanctuary_active": null,
   "sanctuary_completed_tiers": [
     "tier_1",
     "tier_2"
-  ]
+  ],
+  "status_message_ids": {
+    "raid": {
+      "channel_id": 1533490925207031838,
+      "message_id": 1533580339878953051
+    },
+    "orphanage": {
+      "channel_id": 1533490993297363158,
+      "message_id": 1533580341573582889
+    },
+    "guild_task": {
+      "channel_id": 1533491085765120060,
+      "message_id": 1533580344228577413
+    },
+    "sanctuary": {
+      "channel_id": 1533491155310739687,
+      "message_id": 1533580346908475567
+    }
+  },
+  "pending_notification_deletions": []
 }
