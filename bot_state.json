@@ -1,5 +1,5 @@
 {
-  "last_raid_started": "2026-08-02T16:35:44.000000Z",
+  "last_raid_started": "2026-08-02T17:36:15.000000Z",
   "last_orphanage": null,
   "last_worldboss": {
     "3748": {
@@ -9,7 +9,7 @@
   },
   "last_guild_task_key": "npc:7500",
   "guild_task_completed_notified": false,
-  "raid_reminder_sent": true,
+  "raid_reminder_sent": false,
   "no_raid_logged": false,
   "worldboss_reminder_notified_for": {
     "3752": 1785527353,
