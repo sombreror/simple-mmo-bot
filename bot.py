@@ -66,6 +66,36 @@ if RAID_ROLE_ID_RAW:
         RAID_ROLE_ID = None
 
 
+def _parse_optional_channel_id(env_var_name):
+    """Reads an optional channel-id env var. Returns the int ID, or None if
+    unset/blank/invalid (logged as a warning if it was set but not a valid
+    integer, so a typo in .env doesn't fail silently)."""
+    raw = os.getenv(env_var_name)
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"WARNING: {env_var_name} is set but not a valid integer: {raw!r} — ignoring it")
+        return None
+
+
+# Per-feature notification channels. Each one is optional: if not set in
+# .env, it falls back to the main CHANNEL_ID, so the bot keeps working with
+# a single channel until you're ready to split some or all of these out.
+RAID_CHANNEL_ID = _parse_optional_channel_id("RAID_CHANNEL_ID") or CHANNEL_ID
+WORLDBOSS_CHANNEL_ID = _parse_optional_channel_id("WORLDBOSS_CHANNEL_ID") or CHANNEL_ID
+ORPHANAGE_CHANNEL_ID = _parse_optional_channel_id("ORPHANAGE_CHANNEL_ID") or CHANNEL_ID
+GUILD_TASK_CHANNEL_ID = _parse_optional_channel_id("GUILD_TASK_CHANNEL_ID") or CHANNEL_ID
+SANCTUARY_CHANNEL_ID = _parse_optional_channel_id("SANCTUARY_CHANNEL_ID") or CHANNEL_ID
+ERROR_ALERT_CHANNEL_ID = _parse_optional_channel_id("ERROR_ALERT_CHANNEL_ID") or CHANNEL_ID
+
+# Unlike the others, COMMANDS_CHANNEL_ID has NO fallback: None means "no
+# restriction", i.e. slash commands can be used anywhere the bot has
+# access, which is the same behavior as before this feature existed.
+COMMANDS_CHANNEL_ID = _parse_optional_channel_id("COMMANDS_CHANNEL_ID")
+
+
 # ==========================================================
 # LOGGING SETUP
 # ==========================================================
@@ -86,7 +116,9 @@ class JsonFormatter(logging.Formatter):
         }
 
         if record.exc_info:
-            payload["exception"] = "".join(traceback.format_exception(*record.exc_info))
+            payload["exception"] = "".join(
+                traceback.format_exception(*record.exc_info)
+            )
 
         return json.dumps(payload, ensure_ascii=False)
 
@@ -99,9 +131,7 @@ _plain_handler_stream.setFormatter(
     logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 )
 
-logging.basicConfig(
-    level=logging.INFO, handlers=[_json_handler_file, _plain_handler_stream]
-)
+logging.basicConfig(level=logging.INFO, handlers=[_json_handler_file, _plain_handler_stream])
 logger = logging.getLogger(__name__)
 
 
@@ -112,6 +142,53 @@ logger = logging.getLogger(__name__)
 intents = discord.Intents.default()
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+async def _resolve_text_channel(channel_id):
+    """Resolves a single channel ID to a discord.TextChannel, falling back
+    from the gateway cache to an explicit API fetch (same pattern as the
+    old single-channel lookup), and validating it's actually a text
+    channel. Returns None (and logs why) if it can't be resolved."""
+    channel = bot.get_channel(channel_id)
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logger.warning(f"Channel {channel_id} not found via cache or fetch: {e}")
+            return None
+
+    if not isinstance(channel, discord.TextChannel):
+        logger.error(
+            f"Channel {channel_id} is a {type(channel).__name__}, not a TextChannel."
+        )
+        return None
+
+    return channel
+
+
+async def resolve_notification_channels(channel_ids):
+    """Resolves several channel IDs at once (duplicates are only fetched
+    once). Returns a dict {channel_id: TextChannel} containing only the
+    ones that resolved successfully — callers should treat a missing key as
+    'skip sending to this channel this tick' rather than fail the whole
+    tick, since other channels may still be perfectly fine."""
+    resolved = {}
+    for cid in {cid for cid in channel_ids if cid}:
+        channel = await _resolve_text_channel(cid)
+        if channel is not None:
+            resolved[cid] = channel
+    return resolved
+
+
+async def send_to_channel(channels, channel_id, **kwargs):
+    """Sends a message via the pre-resolved `channels` dict, silently
+    skipping (with the warning already logged by resolve_notification_channels)
+    if that particular channel wasn't available this tick."""
+    channel = channels.get(channel_id)
+    if channel is None:
+        return
+    await channel.send(**kwargs)
 
 
 # ==========================================================
@@ -167,17 +244,31 @@ bot_start_time = time.time()
 # restart that happened to land near an event.
 raid_reminder_sent = _state.get("raid_reminder_sent", False)
 RAID_REMINDER_MINUTES_BEFORE = 10  # how long before expiry to warn
-no_raid_logged = _state.get(
-    "no_raid_logged", False
-)  # avoids logging "no active raid" on every single check
+no_raid_logged = _state.get("no_raid_logged", False)  # avoids logging "no active raid" on every single check
+
+# How often the background monitor polls the API. Also used below to size
+# WORLDBOSS_REMINDER_SECONDS_BEFORE with a safety margin (see its comment).
+MONITOR_INTERVAL_SECONDS = 60
 
 # World boss "incoming soon" reminder: warns once per boss cycle, this many
-# minutes before its enable_time. Keyed by boss_id -> enable_time already
+# seconds before its enable_time. Keyed by boss_id -> enable_time already
 # notified for, so a new cycle (different enable_time) can be re-notified.
-WORLDBOSS_REMINDER_MINUTES_BEFORE = 1
-worldboss_reminder_notified_for = _state.get(
-    "worldboss_reminder_notified_for", {}
-)  # {boss_id: enable_time}
+#
+# Kept in SECONDS (not minutes) and set to 2x MONITOR_INTERVAL_SECONDS
+# rather than a value close to the polling interval, on purpose: if this
+# reminder window were only as wide as the polling interval, a single
+# delayed tick (e.g. rate_limit() briefly throttling, or Discord API
+# latency) could skip the window entirely and the reminder would silently
+# never fire for that boss cycle. A 2x margin is enough here because the
+# bot's own request usage (5 endpoints/tick) sits at only ~5-10 req/min
+# against the API's 35 req/min cap, so rate_limit() throttling our own
+# traffic is very unlikely; this margin mainly guards against ordinary
+# network/Discord latency, not rate-limit stalls. The embed still shows the
+# exact spawn time via Discord's own live-updating <t:...:R> timestamp, so
+# the message stays accurate to the second regardless of exactly when
+# within this window it was sent.
+WORLDBOSS_REMINDER_SECONDS_BEFORE = MONITOR_INTERVAL_SECONDS * 2  # 120s
+worldboss_reminder_notified_for = _state.get("worldboss_reminder_notified_for", {})  # {boss_id: enable_time}
 
 # Tracks consecutive 401 (auth) failures PER ENDPOINT, so one endpoint
 # failing repeatedly can't be masked by another endpoint that's still
@@ -187,9 +278,7 @@ worldboss_reminder_notified_for = _state.get(
 consecutive_401_counts = {}  # {endpoint: count}
 # This one IS persisted, so a restart doesn't cause the same ongoing auth
 # failure to be re-announced every time the bot restarts.
-auth_failure_notified_endpoints = _state.get(
-    "auth_failure_notified_endpoints", {}
-)  # {endpoint: True}
+auth_failure_notified_endpoints = _state.get("auth_failure_notified_endpoints", {})  # {endpoint: True}
 AUTH_FAILURE_THRESHOLD = 3
 
 # Guild sanctuary tracking:
@@ -492,13 +581,13 @@ def get_upcoming_worldboss(bosses, now=None):
 
 def worldboss_incoming_soon(boss, now=None):
     """True if the given (not yet active) boss's enable_time falls within
-    WORLDBOSS_REMINDER_MINUTES_BEFORE minutes from now."""
+    WORLDBOSS_REMINDER_SECONDS_BEFORE seconds from now."""
     if now is None:
         now = time.time()
 
     enable_time = boss.get("enable_time") or 0
     remaining = enable_time - now
-    return 0 < remaining <= WORLDBOSS_REMINDER_MINUTES_BEFORE * 60
+    return 0 < remaining <= WORLDBOSS_REMINDER_SECONDS_BEFORE
 
 
 async def check_worldboss():
@@ -510,7 +599,7 @@ async def check_worldboss():
       only "boss is starting" notification is the 1-minute-before "incoming" one.
     - killed: bosses whose state changed from active to dead (hp <= 0) since the last check
     - incoming: the next upcoming boss if it's about to spawn within
-      WORLDBOSS_REMINDER_MINUTES_BEFORE minutes and hasn't been notified yet
+      WORLDBOSS_REMINDER_SECONDS_BEFORE seconds and hasn't been notified yet
       for this specific enable_time, otherwise None
     """
     global last_worldboss, worldboss_reminder_notified_for
@@ -556,10 +645,7 @@ async def check_worldboss():
         enable_time = next_boss.get("enable_time")
         already_notified_for = worldboss_reminder_notified_for.get(boss_id)
 
-        if (
-            worldboss_incoming_soon(next_boss, now)
-            and already_notified_for != enable_time
-        ):
+        if worldboss_incoming_soon(next_boss, now) and already_notified_for != enable_time:
             incoming = next_boss
             worldboss_reminder_notified_for[boss_id] = enable_time
 
@@ -648,11 +734,7 @@ async def check_sanctuary():
     newly_completed = []
     for tier in tiers:
         key = _sanctuary_tier_key(tier)
-        if (
-            key
-            and tier.get("percentage", 0) >= 100
-            and key not in sanctuary_completed_tiers
-        ):
+        if key and tier.get("percentage", 0) >= 100 and key not in sanctuary_completed_tiers:
             sanctuary_completed_tiers.append(key)
             newly_completed.append(tier)
 
@@ -1005,7 +1087,7 @@ def create_auth_failure_embed(count, endpoint):
 # ==========================================================
 
 
-@tasks.loop(minutes=1)
+@tasks.loop(seconds=MONITOR_INTERVAL_SECONDS)
 async def monitor():
     try:
         await _monitor_tick()
@@ -1019,22 +1101,22 @@ async def _monitor_tick():
     global last_check_time
     last_check_time = time.time()
 
-    channel = bot.get_channel(CHANNEL_ID)
+    channels = await resolve_notification_channels(
+        [
+            RAID_CHANNEL_ID,
+            WORLDBOSS_CHANNEL_ID,
+            ORPHANAGE_CHANNEL_ID,
+            GUILD_TASK_CHANNEL_ID,
+            SANCTUARY_CHANNEL_ID,
+            ERROR_ALERT_CHANNEL_ID,
+        ]
+    )
 
-    if channel is None:
-        # The gateway cache may not have the channel yet (e.g. right after
-        # startup), so fall back to an explicit API fetch before giving up.
-        try:
-            channel = await bot.fetch_channel(CHANNEL_ID)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            logger.warning(f"Channel {CHANNEL_ID} not found via cache or fetch: {e}")
-            return
-
-    if not isinstance(channel, discord.TextChannel):
-        logger.error(
-            f"Channel {CHANNEL_ID} is a {type(channel).__name__}, "
-            f"not a TextChannel. Please set a text channel ID in .env"
-        )
+    if not channels:
+        # None of the configured channels could be resolved at all (e.g.
+        # right after startup, or a total misconfiguration) — nothing to do
+        # this tick, try again on the next one.
+        logger.warning("No notification channels could be resolved this tick")
         return
 
     global raid_reminder_sent, no_raid_logged
@@ -1056,65 +1138,84 @@ async def _monitor_tick():
             logger.info("New raid detected, sending notification")
             commit_raid_seen(raid)
             ping_content = f"<@&{RAID_ROLE_ID}>" if RAID_ROLE_ID else None
-            await channel.send(content=ping_content, embed=create_raid_embed(raid))
+            await send_to_channel(
+                channels, RAID_CHANNEL_ID, content=ping_content, embed=create_raid_embed(raid)
+            )
             raid_reminder_sent = False
             persist_state()
         elif not raid_reminder_sent and raid_expiring_soon(raid):
             logger.info("Raid expiring soon, sending reminder")
-            await channel.send(embed=create_raid_reminder_embed(raid))
+            await send_to_channel(
+                channels, RAID_CHANNEL_ID, embed=create_raid_reminder_embed(raid)
+            )
             raid_reminder_sent = True
             persist_state()
 
     orphanage = await check_orphanage()
     if orphanage:
         logger.info("New orphanage event detected, sending notification")
-        await channel.send(embed=create_orphanage_embed(orphanage))
+        await send_to_channel(
+            channels, ORPHANAGE_CHANNEL_ID, embed=create_orphanage_embed(orphanage)
+        )
 
     # NOTE: `boss_activated` is intentionally NOT used to send a "World Boss
     # Active" notification anymore. The only "boss is starting" notification
-    # is the `boss_incoming` one below, sent WORLDBOSS_REMINDER_MINUTES_BEFORE
-    # minutes before the boss actually spawns. `boss_activated` is still
+    # is the `boss_incoming` one below, sent WORLDBOSS_REMINDER_SECONDS_BEFORE
+    # seconds before the boss actually spawns. `boss_activated` is still
     # returned by check_worldboss() because it's needed internally to detect
     # the "killed" transition correctly.
     _boss_activated, boss_killed, boss_incoming = await check_worldboss()
     for boss in boss_killed:
         logger.info(f"World boss killed: {boss.get('name')}")
-        await channel.send(embed=create_worldboss_embed(boss, killed=True))
+        await send_to_channel(
+            channels, WORLDBOSS_CHANNEL_ID, embed=create_worldboss_embed(boss, killed=True)
+        )
     if boss_incoming:
         logger.info(f"World boss incoming soon: {boss_incoming.get('name')}")
-        await channel.send(embed=create_worldboss_incoming_embed(boss_incoming))
+        await send_to_channel(
+            channels, WORLDBOSS_CHANNEL_ID, embed=create_worldboss_incoming_embed(boss_incoming)
+        )
 
     task_event = await check_guild_task()
     if task_event:
         event_type, task = task_event
         if event_type == "new":
             logger.info("New guild task detected, sending notification")
-            await channel.send(embed=create_guild_task_embed(task, completed=False))
+            await send_to_channel(
+                channels, GUILD_TASK_CHANNEL_ID, embed=create_guild_task_embed(task, completed=False)
+            )
         elif event_type == "completed":
             logger.info("Guild task completed, sending notification")
-            await channel.send(embed=create_guild_task_embed(task, completed=True))
+            await send_to_channel(
+                channels, GUILD_TASK_CHANNEL_ID, embed=create_guild_task_embed(task, completed=True)
+            )
 
     sanctuary_active, sanctuary_completed = await check_sanctuary()
     if sanctuary_active:
         logger.info(
             f"Sanctuary tier became active: {sanctuary_active.get('tier', {}).get('name')}"
         )
-        await channel.send(embed=create_sanctuary_active_embed(sanctuary_active))
+        await send_to_channel(
+            channels, SANCTUARY_CHANNEL_ID, embed=create_sanctuary_active_embed(sanctuary_active)
+        )
     for tier in sanctuary_completed:
-        logger.info(f"Sanctuary tier goal reached: {tier.get('tier', {}).get('name')}")
-        await channel.send(embed=create_sanctuary_completed_embed(tier))
+        logger.info(
+            f"Sanctuary tier goal reached: {tier.get('tier', {}).get('name')}"
+        )
+        await send_to_channel(
+            channels, SANCTUARY_CHANNEL_ID, embed=create_sanctuary_completed_embed(tier)
+        )
 
     # Warn once per endpoint if the API key seems to be failing repeatedly
     # on that specific endpoint (see _handle_response for how counts accrue).
     for endpoint, count in list(consecutive_401_counts.items()):
-        if (
-            count >= AUTH_FAILURE_THRESHOLD
-            and endpoint not in auth_failure_notified_endpoints
-        ):
+        if count >= AUTH_FAILURE_THRESHOLD and endpoint not in auth_failure_notified_endpoints:
             logger.error(
                 f"{count} consecutive auth failures on {endpoint}, notifying channel"
             )
-            await channel.send(embed=create_auth_failure_embed(count, endpoint))
+            await send_to_channel(
+                channels, ERROR_ALERT_CHANNEL_ID, embed=create_auth_failure_embed(count, endpoint)
+            )
             auth_failure_notified_endpoints[endpoint] = True
             persist_state()
 
@@ -1192,6 +1293,24 @@ async def on_app_command_error(
 # ==========================================================
 
 
+async def _restrict_commands_to_channel(interaction: discord.Interaction) -> bool:
+    """Global check applied to every slash command via bot.tree.interaction_check
+    (see assignment below). If COMMANDS_CHANNEL_ID is configured, commands
+    used anywhere else get a friendly ephemeral redirect instead of running.
+    If COMMANDS_CHANNEL_ID is not set, this is a no-op and commands work
+    anywhere, same as before this feature existed."""
+    if COMMANDS_CHANNEL_ID is None or interaction.channel_id == COMMANDS_CHANNEL_ID:
+        return True
+
+    await interaction.response.send_message(
+        f"🚫 Usa questo comando in <#{COMMANDS_CHANNEL_ID}>.", ephemeral=True
+    )
+    return False
+
+
+bot.tree.interaction_check = _restrict_commands_to_channel
+
+
 @bot.tree.command(name="raid", description="Show the current guild raid status")
 @discord.app_commands.checks.cooldown(1, 15.0)
 async def raid_command(interaction: discord.Interaction):
@@ -1249,9 +1368,7 @@ async def orphanage_command(interaction: discord.Interaction):
     await interaction.followup.send(embed=create_orphanage_embed(active))
 
 
-@bot.tree.command(
-    name="sanctuary", description="Show the current guild sanctuary status"
-)
+@bot.tree.command(name="sanctuary", description="Show the current guild sanctuary status")
 @discord.app_commands.checks.cooldown(1, 15.0)
 async def sanctuary_command(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -1380,9 +1497,7 @@ async def next_bosses_command(
         return
 
     if len(upcoming) == 1:
-        await interaction.followup.send(
-            embed=create_worldboss_incoming_embed(upcoming[0])
-        )
+        await interaction.followup.send(embed=create_worldboss_incoming_embed(upcoming[0]))
         return
 
     embed = discord.Embed(
