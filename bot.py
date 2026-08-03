@@ -366,6 +366,14 @@ pending_notification_deletions = _state.get("pending_notification_deletions", []
 # how long a fight will last, but we do know exactly when it ends.
 worldboss_active_notification_ids = _state.get("worldboss_active_notification_ids", {})
 
+# The single boss currently shown by the worldboss carousel (status message
+# + /worldboss command), as a boss_id string, or None if there's nothing to
+# show. Shared/global on purpose: there's only one carousel "position" for
+# the whole bot, so the persistent status message and any /worldboss replies
+# always agree on what's being displayed. Persisted so a restart doesn't
+# reset the browsing position back to the first boss.
+worldboss_carousel_boss_id = _state.get("worldboss_carousel_boss_id")
+
 # Default lifetime for notifications that have no natural "this is no
 # longer relevant" moment to key off of (e.g. "tier activated" — unlike a
 # raid's expires_at or a boss's enable_time, there's no API field telling
@@ -399,6 +407,7 @@ def persist_state():
             "status_message_ids": status_message_ids,
             "pending_notification_deletions": pending_notification_deletions,
             "worldboss_active_notification_ids": worldboss_active_notification_ids,
+            "worldboss_carousel_boss_id": worldboss_carousel_boss_id,
         }
     )
 
@@ -418,11 +427,15 @@ def persist_state():
 #    (see send_notification's expire_at/expire_seconds).
 
 
-async def upsert_status_message(channels, channel_id, feature_key, embed):
+async def upsert_status_message(channels, channel_id, feature_key, embed, view=None):
     """Sends the persistent status embed for `feature_key` the first time,
     then edits that SAME message on every subsequent call. If the stored
     message was deleted out-of-band (manually, channel purge, etc.) or its
-    channel changed, transparently sends a fresh one instead."""
+    channel changed, transparently sends a fresh one instead.
+
+    `view` is optional (most status embeds don't need one); when given, it's
+    attached/kept on both the initial send and every later edit — used by
+    the worldboss carousel to keep its ◀ 🔄 ▶ buttons on the message."""
     channel = channels.get(channel_id)
     if channel is None:
         return
@@ -433,7 +446,7 @@ async def upsert_status_message(channels, channel_id, feature_key, embed):
     if info and info.get("channel_id") == channel_id:
         try:
             message = await channel.fetch_message(info["message_id"])
-            await message.edit(embed=embed)
+            await message.edit(embed=embed, view=view)
             return
         except discord.NotFound:
             pass  # message is gone — fall through and recreate it below
@@ -442,7 +455,7 @@ async def upsert_status_message(channels, channel_id, feature_key, embed):
             return
 
     try:
-        message = await channel.send(embed=embed)
+        message = await channel.send(embed=embed, view=view)
     except discord.HTTPException as e:
         logger.warning(f"Failed to send '{feature_key}' status message: {e}")
         return
@@ -1029,6 +1042,30 @@ DIVIDER = "▬" * 24
 # If unset, the embed simply has no thumbnail.
 ORPHANAGE_THUMBNAIL_URL = os.getenv("ORPHANAGE_THUMBNAIL_URL") or None
 
+# The SimpleMMO API returns each world boss's avatar as a RELATIVE path
+# (e.g. "bosses/19"), not a full URL, so it must be combined with a base
+# URL and extension to become something Discord can load as a thumbnail,
+# e.g. "bosses/19" -> "https://web.simple-mmo.com/img/sprites/bosses/19.png"
+# (confirmed real path). Kept configurable via .env in case SimpleMMO
+# changes this path later.
+WORLDBOSS_AVATAR_BASE_URL = os.getenv(
+    "WORLDBOSS_AVATAR_BASE_URL", "https://web.simple-mmo.com/img/sprites/"
+)
+WORLDBOSS_AVATAR_EXTENSION = os.getenv("WORLDBOSS_AVATAR_EXTENSION", "png")
+
+
+def _worldboss_avatar_url(boss):
+    """Builds a full image URL from the boss's relative 'avatar' path
+    (e.g. "bosses/24" -> "https://.../storage/bosses/24.png"), or None if
+    the API didn't provide an avatar path for this boss."""
+    avatar_path = boss.get("avatar")
+    if not avatar_path:
+        return None
+
+    base = WORLDBOSS_AVATAR_BASE_URL.rstrip("/")
+    path = avatar_path.strip("/")
+    return f"{base}/{path}.{WORLDBOSS_AVATAR_EXTENSION}"
+
 
 def _add_divider(embed):
     """Adds a thin horizontal rule between sections of a multi-part status
@@ -1349,47 +1386,210 @@ def _progress_bar(current, target, length=12, fill="🟩", empty="⬛"):
 
 def create_worldboss_embed(boss, killed=False):
     name = boss.get("name", "Unknown")
-    level = boss.get("level", "?")
+    avatar_url = _worldboss_avatar_url(boss)
 
     if killed:
         embed = discord.Embed(
             title="💀 World Boss Defeated!",
-            description=f"**{name}** (Lv. {level}) has fallen. GG!",
+            description=f"**{name}** has fallen. GG! 🎉",
             color=COLOR_WORLDBOSS_DEFEATED,
         )
     else:
         embed = discord.Embed(
             title="🔥 World Boss Active!",
-            description=f"**{name}** (Lv. {level}) has spawned — go get it!",
+            description=f"### ⚔️ {name}\n**It has spawned — go get it now!**",
             color=COLOR_WORLDBOSS,
         )
-        hp = boss.get("current_hp", 0)
-        max_hp = boss.get("max_hp", 0)
-        bar, pct = _progress_bar(hp, max_hp, fill="🟥")
-        embed.add_field(
-            name="❤️ HP",
-            value=f"{bar} **{pct}%**\n{format_number(hp)} / {format_number(max_hp)}",
-            inline=False,
-        )
+
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
 
     return _finalize_embed(embed, "📣 World boss update")
 
 
 def create_worldboss_incoming_embed(boss):
-    """Embed for the 'next world boss is about to spawn' reminder."""
+    """Embed for the 'next world boss is about to spawn' reminder. Shows
+    only the boss name and how long until it spawns — no stats."""
     name = boss.get("name", "Unknown")
-    level = boss.get("level", "?")
     enable_time = boss.get("enable_time")
+    avatar_url = _worldboss_avatar_url(boss)
 
     embed = discord.Embed(
         title="⏳ World Boss Incoming!",
-        description=f"**{name}** (Lv. {level}) is about to spawn — get ready!",
+        description=f"### 🐾 {name}\nGet ready — it's about to spawn!",
         color=COLOR_RAID_WARNING,
     )
     embed.add_field(
-        name="🕐 Spawns", value=format_unix_relative(enable_time), inline=False
+        name="🕐 Spawns", value=f"**{format_unix_relative(enable_time)}**", inline=False
     )
+
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
+
     return _finalize_embed(embed, "📣 World boss reminder")
+
+
+# ----------------------------------------------------------
+# Worldboss carousel (single-boss card + ◀ 🔄 ▶ navigation)
+# ----------------------------------------------------------
+#
+# Instead of listing every boss at once, the worldboss status message (and
+# the /worldboss command) show ONE boss at a time as a compact card — the
+# currently active one if there is one, otherwise the next upcoming one —
+# with buttons to browse to other active/upcoming bosses. Only the name and
+# timing are shown, deliberately no stats.
+
+
+def _worldboss_carousel_list(bosses, now=None):
+    """Builds the ordered list of bosses the carousel can browse through:
+    currently active bosses first (API order), then upcoming (not yet
+    spawned) bosses sorted by soonest enable_time — so pressing ▶ from an
+    active boss naturally leads into what's coming up next."""
+    if now is None:
+        now = time.time()
+
+    active = [b for b in bosses if is_boss_active(b, now)]
+    upcoming = get_upcoming_worldbosses(bosses, now, limit=len(bosses))
+    return active + upcoming
+
+
+def _carousel_index_for(ordered, boss_id):
+    """Finds `boss_id` in `ordered` and returns its index, or 0 (the first
+    entry) if it's None or no longer present — e.g. the previously shown
+    boss just died or its cycle ended, so browsing safely resets to
+    whatever is now first rather than erroring or hiding the card."""
+    if boss_id is not None:
+        for i, b in enumerate(ordered):
+            if str(b.get("id")) == boss_id:
+                return i
+    return 0
+
+
+def create_worldboss_card_embed(boss, now=None):
+    """Single-boss 'card' embed: just the name, plus either 'active now' or
+    how long until it spawns — no HP/level/other stats."""
+    if now is None:
+        now = time.time()
+
+    name = boss.get("name", "Unknown")
+    avatar_url = _worldboss_avatar_url(boss)
+
+    if is_boss_active(boss, now):
+        embed = discord.Embed(
+            title="🔥 Current World Boss",
+            description=f"### ⚔️ {name}",
+            color=COLOR_WORLDBOSS,
+        )
+        embed.add_field(name="Status", value="🟢 **Active now** — go get it!", inline=False)
+    else:
+        enable_time = boss.get("enable_time")
+        embed = discord.Embed(
+            title="⏳ Next World Boss",
+            description=f"### 🐾 {name}",
+            color=COLOR_RAID_WARNING,
+        )
+        embed.add_field(
+            name="Activate in", value=f"**{format_unix_relative(enable_time)}**", inline=True
+        )
+        if enable_time:
+            embed.add_field(name="Activate on", value=f"<t:{int(enable_time)}:f>", inline=True)
+
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
+
+    return _finalize_embed(embed, "🔄 Live status — use the buttons to browse")
+
+
+def create_worldboss_card_empty_embed():
+    """Card shown when there's currently nothing to browse (no active and
+    no upcoming bosses at all)."""
+    embed = discord.Embed(
+        title="🔥 World Boss",
+        description="😴 No world boss is active or scheduled right now.",
+        color=COLOR_NEUTRAL,
+    )
+    return _finalize_embed(embed, "🔄 Live status — use the buttons to browse")
+
+
+def _update_worldboss_carousel(bosses, now=None):
+    """Validates the shared carousel pointer against the latest boss list
+    (falling back to the first entry if the previously shown boss is gone)
+    and returns the card embed for whichever boss it now points to. Persists
+    the pointer only when it actually changes, to avoid needless disk writes
+    on every monitor tick."""
+    global worldboss_carousel_boss_id
+
+    if now is None:
+        now = time.time()
+
+    ordered = _worldboss_carousel_list(bosses, now)
+    if not ordered:
+        if worldboss_carousel_boss_id is not None:
+            worldboss_carousel_boss_id = None
+            persist_state()
+        return create_worldboss_card_empty_embed()
+
+    idx = _carousel_index_for(ordered, worldboss_carousel_boss_id)
+    boss = ordered[idx]
+    new_id = str(boss.get("id"))
+    if new_id != worldboss_carousel_boss_id:
+        worldboss_carousel_boss_id = new_id
+        persist_state()
+
+    return create_worldboss_card_embed(boss, now)
+
+
+class WorldBossCarouselView(discord.ui.View):
+    """Persistent ◀ 🔄 ▶ controls for browsing world bosses one at a time.
+    Shared by the persistent status message and the /worldboss command —
+    the browsing position (worldboss_carousel_boss_id) is global, so every
+    copy of this view stays in sync and pressing a button anywhere updates
+    what the status message shows on its next refresh too. `timeout=None`
+    plus fixed custom_ids make this a persistent view: it keeps working
+    after a bot restart as long as it's re-registered via bot.add_view()
+    (see on_ready)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="worldboss_carousel_prev")
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._show(interaction, step=-1)
+
+    @discord.ui.button(label="🔄", style=discord.ButtonStyle.secondary, custom_id="worldboss_carousel_refresh")
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._show(interaction, step=0)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="worldboss_carousel_next")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._show(interaction, step=1)
+
+    async def _show(self, interaction: discord.Interaction, step: int):
+        global worldboss_carousel_boss_id
+
+        bosses = await get_worldboss()
+        if bosses is None:
+            await interaction.response.send_message(
+                "⚠️ Couldn't fetch world boss data from the API right now.", ephemeral=True
+            )
+            return
+
+        now = time.time()
+        ordered = _worldboss_carousel_list(bosses, now)
+
+        if not ordered:
+            worldboss_carousel_boss_id = None
+            persist_state()
+            await interaction.response.edit_message(embed=create_worldboss_card_empty_embed(), view=self)
+            return
+
+        idx = _carousel_index_for(ordered, worldboss_carousel_boss_id)
+        idx = (idx + step) % len(ordered)
+        boss = ordered[idx]
+        worldboss_carousel_boss_id = str(boss.get("id"))
+        persist_state()
+
+        await interaction.response.edit_message(embed=create_worldboss_card_embed(boss, now), view=self)
 
 
 def create_guild_task_embed(task, completed=False):
@@ -1695,8 +1895,8 @@ async def _monitor_tick():
         boss_id = str(boss.get("id"))
 
         # Remove the earlier "Active" notification for this exact boss right
-        # now — it's stale info (old HP, "go get it!") the instant the boss
-        # is dead, so there's no reason to wait for its own timer.
+        # now — it's stale info the instant the boss is dead, so there's no
+        # reason to wait for its own timer.
         stale = worldboss_active_notification_ids.pop(boss_id, None)
         if stale:
             stale_channel = channels.get(stale["channel_id"])
@@ -1729,7 +1929,11 @@ async def _monitor_tick():
         )
     if bosses is not None:
         await upsert_status_message(
-            channels, WORLDBOSS_CHANNEL_ID, "worldboss", create_worldboss_status_embed(bosses)
+            channels,
+            WORLDBOSS_CHANNEL_ID,
+            "worldboss",
+            _update_worldboss_carousel(bosses),
+            view=WorldBossCarouselView(),
         )
 
     task_event, task = await check_guild_task()
@@ -1818,6 +2022,12 @@ async def on_ready():
 
     logger.info(f"Bot connected as {bot.user}")
     logger.info(f"Guild ID: {GUILD_ID}")
+
+    # Re-registers the worldboss carousel's ◀ 🔄 ▶ buttons as a persistent
+    # view. Without this, buttons on messages sent before a restart would
+    # stop responding once the process restarts (discord.py forgets
+    # non-persistent views on restart; this re-attaches by custom_id).
+    bot.add_view(WorldBossCarouselView())
 
     if not _synced:
         await bot.tree.sync()
@@ -1993,94 +2203,7 @@ async def task_command(interaction: discord.Interaction):
     await interaction.followup.send(embed=create_guild_task_status_embed(task))
 
 
-def create_worldboss_status_embed(bosses, now=None):
-    """Always-current status of world bosses (all active ones + ALL
-    upcoming spawns, not just the next one), shared by both the /worldboss
-    command and the persistent status message so the two never drift
-    apart."""
-    if now is None:
-        now = time.time()
-
-    active_bosses = [b for b in bosses if is_boss_active(b, now)]
-    # Show every upcoming boss, not just the immediate next one — several
-    # can be scheduled across the week.
-    upcoming_bosses = get_upcoming_worldbosses(bosses, now, limit=10)
-
-    if not bosses:
-        # The API returned no boss data at all — most likely this week's
-        # bosses have already all been cleared and a new batch hasn't been
-        # posted yet, rather than an error (a real failure never reaches
-        # here — see check_worldboss).
-        embed = discord.Embed(
-            title="🔥 World Bosses",
-            description=(
-                "😴 No world boss data available right now.\n"
-                "This usually means this week's bosses have all already "
-                "been cleared — a new batch should appear later."
-            ),
-            color=COLOR_NEUTRAL,
-        )
-        return _finalize_embed(embed, "🔄 Live status — updates automatically")
-
-    if not active_bosses and not upcoming_bosses:
-        embed = discord.Embed(
-            title="🔥 World Bosses",
-            description=(
-                "😴 No world boss is active or scheduled right now — looks "
-                "like this week's bosses have all been cleared."
-            ),
-            color=COLOR_NEUTRAL,
-        )
-        return _finalize_embed(embed, "🔄 Live status — updates automatically")
-
-    if not active_bosses:
-        embed = discord.Embed(
-            title="🔥 World Bosses",
-            description="😴 No world boss is currently active.",
-            color=COLOR_NEUTRAL,
-        )
-    else:
-        embed = discord.Embed(title="🔥 Active World Bosses", color=COLOR_WORLDBOSS)
-        # Leave room for the upcoming-bosses field, the divider, and the
-        # "Last Updated" field added by _finalize_embed — and stay safely
-        # under Discord's 25-field-per-embed hard limit.
-        max_active_fields = DISCORD_MAX_EMBED_FIELDS - 3
-        for boss in active_bosses[:max_active_fields]:
-            hp = boss.get("current_hp", 0)
-            max_hp = boss.get("max_hp", 1)
-            bar, pct = _progress_bar(hp, max_hp, length=10, fill="🟥")
-            embed.add_field(
-                name=f"⚔️ {boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
-                value=_safe_field_value(
-                    f"{bar} **{pct}%**\n{format_number(hp)} / {format_number(max_hp)}"
-                ),
-                inline=False,
-            )
-        remaining = len(active_bosses) - max_active_fields
-        if remaining > 0:
-            embed.add_field(
-                name="…", value=f"and {remaining} more active", inline=False
-            )
-
-    # Always show ALL upcoming (not-yet-spawned) bosses, not just one.
-    if upcoming_bosses:
-        if active_bosses:
-            _add_divider(embed)
-        lines = [
-            f"**{b.get('name', 'Unknown')}** (Lv. {b.get('level', '?')}) "
-            f"— spawns {format_unix_relative(b.get('enable_time'))}"
-            for b in upcoming_bosses
-        ]
-        embed.add_field(
-            name=f"⏳ Upcoming World Bosses ({len(upcoming_bosses)})",
-            value=_safe_field_value("\n".join(lines)),
-            inline=False,
-        )
-
-    return _finalize_embed(embed, "🔄 Live status — updates automatically")
-
-
-@bot.tree.command(name="worldboss", description="Show active world bosses")
+@bot.tree.command(name="worldboss", description="Show the current world boss (browsable)")
 @discord.app_commands.checks.cooldown(1, 15.0)
 async def worldboss_command(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -2093,8 +2216,8 @@ async def worldboss_command(interaction: discord.Interaction):
         )
         return
 
-    embed = create_worldboss_status_embed(bosses)
-    await interaction.followup.send(embed=embed)
+    embed = _update_worldboss_carousel(bosses)
+    await interaction.followup.send(embed=embed, view=WorldBossCarouselView())
 
 
 @bot.tree.command(
@@ -2138,9 +2261,9 @@ async def next_bosses_command(
     )
     for boss in upcoming:
         embed.add_field(
-            name=f"⚔️ {boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
+            name=f"🐾 {boss.get('name', 'Unknown')}",
             value=_safe_field_value(
-                f"Spawns {format_unix_relative(boss.get('enable_time'))}"
+                f"Spawns **{format_unix_relative(boss.get('enable_time'))}**"
             ),
             inline=False,
         )

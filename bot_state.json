@@ -1,5 +1,5 @@
 {
-  "last_raid_started": "2026-08-03T12:54:48.000000Z",
+  "last_raid_started": "2026-08-03T16:56:00.000000Z",
   "last_orphanage": null,
   "last_worldboss": {
     "3755": {
@@ -17,10 +17,6 @@
     "3758": {
       "active": false,
       "hp": 20650120
-    },
-    "3759": {
-      "active": false,
-      "hp": 17332973
     },
     "3760": {
       "active": false,
@@ -57,7 +53,7 @@
   },
   "last_guild_task_key": "npc:7500",
   "guild_task_completed_notified": false,
-  "last_guild_task_current": 570,
+  "last_guild_task_current": 2283,
   "raid_reminder_sent": false,
   "no_raid_logged": false,
   "worldboss_reminder_notified_for": {
@@ -65,7 +61,8 @@
     "3742": 1785594386,
     "3749": 1785595105,
     "3747": 1785615289,
-    "3748": 1785701296
+    "3748": 1785701296,
+    "3759": 1785776118
   },
   "auth_failure_notified_endpoints": {},
   "last_sanctuary_active": null,
@@ -98,14 +95,10 @@
   "pending_notification_deletions": [
     {
       "channel_id": 1533490925207031838,
-      "message_id": 1533820523866488935,
-      "expires_at": 1785776088.0
-    },
-    {
-      "channel_id": 1533491085765120060,
-      "message_id": 1533825566958944437,
-      "expires_at": 1785784512.3947358
+      "message_id": 1533881175158951967,
+      "expires_at": 1785804960.0
     }
   ],
-  "worldboss_active_notification_ids": {}
+  "worldboss_active_notification_ids": {},
+  "worldboss_carousel_boss_id": "3767"
 }
