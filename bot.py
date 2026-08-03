@@ -298,6 +298,18 @@ bot_start_time = time.time()
 # restart that happened to land near an event.
 raid_reminder_sent = _state.get("raid_reminder_sent", False)
 RAID_REMINDER_MINUTES_BEFORE = 10  # how long before expiry to warn
+
+# How long the "raid started" ping notification stays visible before being
+# auto-deleted. Deliberately short — it's just a quick heads-up that
+# something happened; the persistent "Raid Status" message (edited in
+# place, see create_raid_status_embed) already shows the full up-to-date
+# details for as long as the raid stays active, so this one doesn't need
+# to linger for hours like it used to. Note actual deletion only happens
+# on the next monitor tick after this many seconds pass (see
+# cleanup_expired_notifications), so with the default 60s monitor
+# interval it'll realistically vanish within roughly a minute, not
+# instantly.
+RAID_START_NOTIFICATION_LIFETIME_SECONDS = 30
 no_raid_logged = _state.get("no_raid_logged", False)  # avoids logging "no active raid" on every single check
 
 # How often the background monitor polls the API. Also used below to size
@@ -1309,20 +1321,63 @@ def _raid_duration_only(raid):
     return _format_duration(expires_ts - started_ts)
 
 
+def _raid_location_line(locations):
+    """Formats the raid location(s) for a single-line header when there's
+    just one (the common case, per the API), or falls back to a bulleted
+    block for the rare multi-location raid."""
+    if not locations:
+        return "Unknown", False
+    if len(locations) == 1:
+        return locations[0], False
+    return _bullet_list(locations), True
+
+
+def _raid_time_bar(raid, now=None, length=12):
+    """Builds a color-coded bar showing how much of the raid's total time
+    window is still left. The fill color shifts green -> yellow -> red as
+    expiry approaches, so urgency reads at a glance. Returns
+    (bar_string, percent_remaining, seconds_remaining), or None if
+    timestamps are missing or unparseable."""
+    if now is None:
+        now = datetime.now(timezone.utc).timestamp()
+
+    started_ts = _iso_to_unix(raid.get("started_at"))
+    expires_ts = _iso_to_unix(raid.get("expires_at"))
+    if started_ts is None or expires_ts is None or expires_ts <= started_ts:
+        return None
+
+    total = expires_ts - started_ts
+    elapsed = max(0, min(total, now - started_ts))
+    remaining_seconds = max(0, total - elapsed)
+    remaining_pct = max(0, min(100, round(remaining_seconds / total * 100)))
+
+    if remaining_pct > 50:
+        fill = "🟩"
+    elif remaining_pct > 20:
+        fill = "🟨"
+    else:
+        fill = "🟥"
+
+    bar, _ = _progress_bar(elapsed, total, length=length, fill=fill)
+    return bar, remaining_pct, remaining_seconds
+
+
 def create_raid_embed(raid):
+    location_line, is_multi = _raid_location_line(raid.get("locations", []))
+
     embed = discord.Embed(
         title="⚔️ Guild Raid Started!",
-        description="A new raid has begun — rally the guild!",
+        description=f"### 📍 {location_line}\nRally the guild — let's get in there!"
+        if not is_multi
+        else "### ⚔️ A new raid has begun!\nRally the guild — let's get in there!",
         color=COLOR_RAID,
     )
 
-    locations = raid.get("locations", [])
-    embed.add_field(
-        name="📍 Locations", value=_safe_field_value(_bullet_list(locations)), inline=False
-    )
+    if is_multi:
+        embed.add_field(name="📍 Locations", value=_safe_field_value(location_line), inline=False)
 
-    embed.add_field(name="🕐 Started", value=parse_timestamp(raid.get("started_at")), inline=True)
-    embed.add_field(name="⏰ Expires", value=parse_timestamp(raid.get("expires_at")), inline=True)
+    embed.add_field(name="🕐 Started", value=parse_timestamp(raid.get("started_at")), inline=False)
+    embed.add_field(name="⏰ Expires", value=parse_timestamp(raid.get("expires_at")), inline=False)
 
     duration = _raid_duration_only(raid)
     if duration:
@@ -1334,9 +1389,19 @@ def create_raid_embed(raid):
 def create_raid_reminder_embed(raid):
     embed = discord.Embed(
         title="⏰ Raid Expiring Soon!",
-        description="Time's almost up — get your hits in before it's gone!",
+        description="### 🔴 Time's almost up!\nGet your hits in before it's gone.",
         color=COLOR_RAID_WARNING,
     )
+
+    bar_info = _raid_time_bar(raid)
+    if bar_info:
+        bar, remaining_pct, remaining_seconds = bar_info
+        embed.add_field(
+            name="⏳ Time Remaining",
+            value=f"`{bar}`\n**{_format_duration(remaining_seconds)} left** ({remaining_pct}%)",
+            inline=False,
+        )
+
     embed.add_field(name="⌛ Expires", value=parse_timestamp(raid.get("expires_at")), inline=False)
     return _finalize_embed(embed, "📣 Raid reminder")
 
@@ -1348,28 +1413,37 @@ def create_raid_status_embed(raid):
     if raid is None or not is_valid_raid(raid):
         embed = discord.Embed(
             title="⚔️ Raid Status",
-            description="😴 No active guild raid right now.",
+            description="### 😴 No active raid right now\nWe'll ping this channel the moment one starts.",
             color=COLOR_NEUTRAL,
         )
-    else:
-        embed = discord.Embed(
-            title="⚔️ Raid Status",
-            description="🟢 A raid is currently active!",
-            color=COLOR_RAID,
-        )
-        locations = raid.get("locations", [])
-        embed.add_field(
-            name="📍 Locations", value=_safe_field_value(_bullet_list(locations)), inline=False
-        )
-        embed.add_field(
-            name="🕐 Started", value=parse_timestamp(raid.get("started_at")), inline=True
-        )
-        embed.add_field(
-            name="⏰ Expires", value=parse_timestamp(raid.get("expires_at")), inline=True
-        )
-        duration = _raid_duration_only(raid)
+        return _finalize_embed(embed, "🔄 Live status — updates automatically")
+
+    location_line, is_multi = _raid_location_line(raid.get("locations", []))
+
+    embed = discord.Embed(
+        title="⚔️ Raid Status",
+        description=f"### 🟢 Active — 📍 {location_line}"
+        if not is_multi
+        else "### 🟢 A raid is currently active!",
+        color=COLOR_RAID,
+    )
+
+    if is_multi:
+        embed.add_field(name="📍 Locations", value=_safe_field_value(location_line), inline=False)
+
+    embed.add_field(name="🕐 Started", value=parse_timestamp(raid.get("started_at")), inline=False)
+    embed.add_field(name="⏰ Expires", value=parse_timestamp(raid.get("expires_at")), inline=False)
+
+    bar_info = _raid_time_bar(raid)
+    duration = _raid_duration_only(raid)
+    if bar_info:
+        bar, remaining_pct, remaining_seconds = bar_info
+        value = f"`{bar}`\n**{_format_duration(remaining_seconds)} left** ({remaining_pct}%)"
         if duration:
-            embed.add_field(name="⏳ Duration", value=f"**{duration}**", inline=True)
+            value += f"  •  {duration} total"
+        embed.add_field(name="⏳ Time Remaining", value=_safe_field_value(value), inline=False)
+    elif duration:
+        embed.add_field(name="⏳ Duration", value=f"**{duration}**", inline=True)
 
     return _finalize_embed(embed, "🔄 Live status — updates automatically")
 
@@ -1821,14 +1895,12 @@ async def _monitor_tick():
             logger.info("New raid detected, sending notification")
             commit_raid_seen(raid)
             ping_content = f"<@&{RAID_ROLE_ID}>" if RAID_ROLE_ID else None
-            raid_expire_at = _iso_to_unix(raid.get("expires_at"))
             await send_notification(
                 channels,
                 RAID_CHANNEL_ID,
                 content=ping_content,
                 embed=create_raid_embed(raid),
-                expire_at=raid_expire_at,
-                expire_seconds=None if raid_expire_at else DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
+                expire_seconds=RAID_START_NOTIFICATION_LIFETIME_SECONDS,
             )
             raid_reminder_sent = False
             persist_state()
