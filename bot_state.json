@@ -1,14 +1,63 @@
 {
-  "last_raid_started": "2026-08-02T17:36:15.000000Z",
+  "last_raid_started": "2026-08-03T12:54:48.000000Z",
   "last_orphanage": null,
   "last_worldboss": {
-    "3748": {
-      "active": true,
-      "hp": 19341458
+    "3755": {
+      "active": false,
+      "hp": 125703458
+    },
+    "3756": {
+      "active": false,
+      "hp": 6540740
+    },
+    "3757": {
+      "active": false,
+      "hp": 12185204
+    },
+    "3758": {
+      "active": false,
+      "hp": 20650120
+    },
+    "3759": {
+      "active": false,
+      "hp": 17332973
+    },
+    "3760": {
+      "active": false,
+      "hp": 20872138
+    },
+    "3761": {
+      "active": false,
+      "hp": 31918910
+    },
+    "3762": {
+      "active": false,
+      "hp": 53076869
+    },
+    "3763": {
+      "active": false,
+      "hp": 87727976
+    },
+    "3764": {
+      "active": false,
+      "hp": 60053193
+    },
+    "3765": {
+      "active": false,
+      "hp": 74612126
+    },
+    "3766": {
+      "active": false,
+      "hp": 144179275
+    },
+    "3767": {
+      "active": false,
+      "hp": 402684970
     }
   },
   "last_guild_task_key": "npc:7500",
   "guild_task_completed_notified": false,
+  "last_guild_task_current": 552,
   "raid_reminder_sent": false,
   "no_raid_logged": false,
   "worldboss_reminder_notified_for": {
@@ -27,7 +76,7 @@
   "status_message_ids": {
     "raid": {
       "channel_id": 1533490925207031838,
-      "message_id": 1533580339878953051
+      "message_id": 1533746699174940835
     },
     "orphanage": {
       "channel_id": 1533490993297363158,
@@ -40,7 +89,23 @@
     "sanctuary": {
       "channel_id": 1533491155310739687,
       "message_id": 1533580346908475567
+    },
+    "worldboss": {
+      "channel_id": 1533490959554314241,
+      "message_id": 1533762948793893077
     }
   },
-  "pending_notification_deletions": []
+  "pending_notification_deletions": [
+    {
+      "channel_id": 1533490925207031838,
+      "message_id": 1533820523866488935,
+      "expires_at": 1785776088.0
+    },
+    {
+      "channel_id": 1533491085765120060,
+      "message_id": 1533825566958944437,
+      "expires_at": 1785784512.3947358
+    }
+  ],
+  "worldboss_active_notification_ids": {}
 }

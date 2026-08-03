@@ -1,3 +1,11 @@
+# ==========================================================
+# LANGUAGE POLICY
+# ==========================================================
+# All code, comments, docstrings, log messages, and embed/UI text in this
+# file must always be written in English, regardless of the language used
+# in the conversation that produced or modified this file.
+# ==========================================================
+
 import discord
 from discord.ext import commands, tasks
 
@@ -208,16 +216,21 @@ async def send_notification(channels, channel_id, expire_at=None, expire_seconds
     is automatically deleted once that time passes (checked once per
     monitor tick — see cleanup_expired_notifications). Neither given means
     it's never auto-deleted (used for things like the auth-failure alert,
-    which should stick around until a human deals with it)."""
+    which should stick around until a human deals with it).
+
+    Returns the sent discord.Message (or None if it wasn't sent), so a
+    caller that needs to react to a LATER precise event — e.g. deleting a
+    "boss active" notification exactly when that boss is killed, rather
+    than waiting for a flat timer — can hang onto its channel/message ID."""
     channel = channels.get(channel_id)
     if channel is None:
-        return
+        return None
 
     try:
         message = await channel.send(**kwargs)
     except discord.HTTPException as e:
         logger.warning(f"Failed to send notification to channel {channel_id}: {e}")
-        return
+        return None
 
     if expire_at is None and expire_seconds is not None:
         expire_at = time.time() + expire_seconds
@@ -228,6 +241,8 @@ async def send_notification(channels, channel_id, expire_at=None, expire_seconds
             {"channel_id": channel_id, "message_id": message.id, "expires_at": expire_at}
         )
         persist_state()
+
+    return message
 
 
 # ==========================================================
@@ -343,6 +358,14 @@ status_message_ids = _state.get("status_message_ids", {})
 # deletions survive a bot restart instead of being forgotten.
 pending_notification_deletions = _state.get("pending_notification_deletions", [])
 
+# Tracks the "🔥 World Boss Active!" notification message for each currently
+# active boss, keyed by boss_id -> {"channel_id", "message_id"}. Unlike
+# most notifications (which expire after a flat time window), this one is
+# deleted PRECISELY the moment that same boss is confirmed killed — see the
+# boss_killed handling in _monitor_tick — since we don't know in advance
+# how long a fight will last, but we do know exactly when it ends.
+worldboss_active_notification_ids = _state.get("worldboss_active_notification_ids", {})
+
 # Default lifetime for notifications that have no natural "this is no
 # longer relevant" moment to key off of (e.g. "tier activated" — unlike a
 # raid's expires_at or a boss's enable_time, there's no API field telling
@@ -350,6 +373,12 @@ pending_notification_deletions = _state.get("pending_notification_deletions", []
 # people reading the channel occasionally will still see it, short enough
 # that channels don't fill up with month-old announcements.
 DEFAULT_NOTIFICATION_LIFETIME_SECONDS = 6 * 60 * 60  # 6 hours
+
+# Tracks the current guild task cycle's last-known current_amount, so a new
+# cycle that happens to share the exact same type+target as the previous
+# one (see check_guild_task) can still be detected — see FIX in
+# check_guild_task for details.
+last_guild_task_current = _state.get("last_guild_task_current")
 
 
 def persist_state():
@@ -360,6 +389,7 @@ def persist_state():
             "last_worldboss": last_worldboss,
             "last_guild_task_key": last_guild_task_key,
             "guild_task_completed_notified": guild_task_completed_notified,
+            "last_guild_task_current": last_guild_task_current,
             "raid_reminder_sent": raid_reminder_sent,
             "no_raid_logged": no_raid_logged,
             "worldboss_reminder_notified_for": worldboss_reminder_notified_for,
@@ -368,6 +398,7 @@ def persist_state():
             "sanctuary_completed_tiers": sanctuary_completed_tiers,
             "status_message_ids": status_message_ids,
             "pending_notification_deletions": pending_notification_deletions,
+            "worldboss_active_notification_ids": worldboss_active_notification_ids,
         }
     )
 
@@ -745,22 +776,25 @@ def worldboss_incoming_soon(boss, now=None):
 
 async def check_worldboss():
     """Returns (activated, killed, incoming, bosses):
-    - activated: bosses whose state changed from inactive to active since the last check.
-      NOTE: this is still tracked/returned for internal state purposes (it's
-      needed to correctly detect the later "killed" transition), but the
-      caller intentionally does NOT send a Discord notification for it — the
-      only "boss is starting" notification is the 1-minute-before "incoming" one.
+    - activated: bosses whose state changed from inactive to active since
+      the last check — the caller sends a "World Boss Active!" notification
+      for each of these, in addition to the earlier "incoming" heads-up.
     - killed: bosses whose state changed from active to dead (hp <= 0) since the last check
     - incoming: the next upcoming boss if it's about to spawn within
       WORLDBOSS_REMINDER_SECONDS_BEFORE seconds and hasn't been notified yet
       for this specific enable_time, otherwise None
     - bosses: the full raw boss list from the API (for the always-up-to-date
-      status embed), or None if the API call failed this tick.
+      status embed) — an empty list [] is valid ("no bosses right now"),
+      only None means the API call itself failed this tick.
     """
     global last_worldboss, worldboss_reminder_notified_for
 
     bosses = await get_worldboss()
-    if not bosses:
+    if bosses is None:
+        # Only a real API failure short-circuits here. An empty list is a
+        # perfectly valid response (no bosses active or scheduled right
+        # now) and must fall through so the status embed still gets
+        # updated to reflect that — not be treated the same as a failure.
         return [], [], None, None
 
     now = time.time()
@@ -830,7 +864,7 @@ async def check_guild_task():
       failed this tick (so the caller can skip updating the status embed
       and leave the last known one intact instead of showing an error).
     """
-    global last_guild_task_key, guild_task_completed_notified
+    global last_guild_task_key, guild_task_completed_notified, last_guild_task_current
 
     task = await get_guild_task()
     if task is None:
@@ -844,17 +878,37 @@ async def check_guild_task():
     current = task.get("current_amount", 0)
     key = f"{task_type}:{target}"
 
-    if key != last_guild_task_key:
+    # FIX: the API gives us no id/started_at for guild tasks — only
+    # type+target+current_amount — so a brand new cycle that happens to
+    # share the exact same type AND target_amount as the previous one
+    # (e.g. "travel:30000" recurring weeks later) produces the same `key`
+    # and would otherwise be silently missed as "not new", with
+    # guild_task_completed_notified staying True from last time so even
+    # the completion notification would never fire again for it.
+    # Detect this by noticing current_amount going DOWN: within a single
+    # cycle it can only increase, so a drop means a fresh cycle started.
+    is_new_key = key != last_guild_task_key
+    is_restarted_cycle = (
+        not is_new_key
+        and last_guild_task_current is not None
+        and current < last_guild_task_current
+    )
+
+    if is_new_key or is_restarted_cycle:
         last_guild_task_key = key
         guild_task_completed_notified = False
+        last_guild_task_current = current
         persist_state()
         return ("new", task), task
+
+    last_guild_task_current = current
 
     if current >= target and not guild_task_completed_notified:
         guild_task_completed_notified = True
         persist_state()
         return ("completed", task), task
 
+    persist_state()
     return None, task
 
 
@@ -949,6 +1003,61 @@ def _iso_to_unix(iso_str):
 DISCORD_MAX_EMBED_FIELDS = 25
 DISCORD_MAX_FIELD_VALUE_LENGTH = 1024
 
+# A consistent color per feature, reused across both its notification
+# embeds and its persistent status embed so the two always feel like part
+# of the same "section" at a glance.
+COLOR_RAID = 0xE74C3C
+COLOR_RAID_WARNING = 0xF39C12
+COLOR_WORLDBOSS = 0xE67E22
+COLOR_WORLDBOSS_DEFEATED = 0x7F8C8D
+COLOR_ORPHANAGE = 0x2ECC71
+COLOR_GUILD_TASK = 0x3498DB
+COLOR_GUILD_TASK_COMPLETE = 0x2ECC71
+COLOR_SANCTUARY = 0x9B59B6
+COLOR_SANCTUARY_COMPLETE = 0xF1C40F
+COLOR_ERROR = 0xC0392B
+COLOR_NEUTRAL = 0x99AAB5  # used for "nothing active right now" states
+
+DIVIDER = "▬" * 24
+
+# Optional thumbnail for orphanage embeds (image shown top-right). We
+# don't hardcode a "guessed" URL here because if it doesn't actually exist
+# Discord just silently shows nothing broken, but it's still better not to
+# assert an unverified link: if you want a custom icon, set its direct URL
+# in ORPHANAGE_THUMBNAIL_URL in your .env (e.g. a link to an image uploaded
+# to Discord itself, or the official icon if you source it from the site).
+# If unset, the embed simply has no thumbnail.
+ORPHANAGE_THUMBNAIL_URL = os.getenv("ORPHANAGE_THUMBNAIL_URL") or None
+
+
+def _add_divider(embed):
+    """Adds a thin horizontal rule between sections of a multi-part status
+    embed (e.g. between per-tier fields and a summary field below them)."""
+    embed.add_field(name="\u200b", value=DIVIDER, inline=False)
+
+
+def _bullet_list(items):
+    """Formats a list of strings as a bulleted list, one per line — reads
+    much better in an embed than a comma-separated blob of text."""
+    if not items:
+        return "*None*"
+    return "\n".join(f"• {item}" for item in items)
+
+
+def _finalize_embed(embed, footer_text="Automated update"):
+    """Applies the branding/chrome shared by every embed the bot sends: the
+    bot's own avatar as a small author icon (top-left), a footer note, and
+    a 'Last Updated' field using Discord's live relative timestamp (e.g.
+    'a few seconds ago') — it keeps counting up in the client on its own,
+    with no need for the bot to re-edit the message."""
+    if bot.user:
+        embed.set_author(name="SimpleMMO Monitor", icon_url=bot.user.display_avatar.url)
+    now = datetime.now(timezone.utc)
+    embed.add_field(name="🕐 Last Updated", value=f"<t:{int(now.timestamp())}:R>", inline=False)
+    embed.set_footer(text=footer_text)
+    embed.timestamp = now
+    return embed
+
 
 def _safe_field_value(text, limit=DISCORD_MAX_FIELD_VALUE_LENGTH):
     """Truncates a field value so it never exceeds Discord's per-field
@@ -957,6 +1066,19 @@ def _safe_field_value(text, limit=DISCORD_MAX_FIELD_VALUE_LENGTH):
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
+
+
+def format_number(n):
+    """Abbreviates large numbers for readability while keeping the exact
+    value visible, e.g. 1,234,567 -> '1.2M (1,234,567)'."""
+    n = n or 0
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f}B ({n:,})"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M ({n:,})"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K ({n:,})"
+    return f"{n:,}"
 
 
 def format_unix_relative(unix_ts):
@@ -985,59 +1107,201 @@ def _format_duration(seconds):
     return f"{minutes}m"
 
 
-def _raid_duration_field_value(raid):
-    """Builds the combined 'started + total duration' field value shared by
-    the raid-started notification and the persistent raid status."""
-    started_at = raid.get("started_at")
-    expires_at = raid.get("expires_at")
+def _orphanage_tier_visual(tier):
+    """Determines the icon, status label, and bar color for a single
+    orphanage tier, centralizing the styling logic used by both the
+    single-tier notification embed and the all-tiers status embed, so
+    they always stay visually consistent with each other."""
+    percentage = tier.get("percentage", 0)
+    is_active = tier.get("is_active", False)
 
-    lines = [f"🕐 Started: {parse_timestamp(started_at)}"]
+    if is_active:
+        return "🟢", "In Progress", "🟩"
+    if tier.get("has_expired"):
+        return "⌛", "Expired", "🟥"
+    if percentage >= 100 or tier.get("goal_reached_at"):
+        return "🏆", "Goal Reached", "🟨"
+    if tier.get("in_progress"):
+        return "🔻", "Pending", "🟦"
+    return "⚙️", "Not Started", "⬛"
 
-    started_ts = _iso_to_unix(started_at)
-    expires_ts = _iso_to_unix(expires_at)
-    if started_ts is not None and expires_ts is not None:
-        lines.append(f"⏳ Duration: {_format_duration(expires_ts - started_ts)}")
 
-    return "\n".join(lines)
+def _orphanage_progress_block(tier, bar_length=14):
+    """Builds the shared 'bar + numbers' block used by every orphanage
+    embed: a bar colored to match the tier's status, the percentage in
+    bold, and the numeric breakdown (current / target / remaining)."""
+    current = tier.get("current_value", 0)
+    target = tier.get("target_value", 0)
+    remaining = tier.get("target_remaining", max(target - current, 0))
+    percentage = tier.get("percentage", 0)
+
+    _, _, bar_fill = _orphanage_tier_visual(tier)
+    bar, _ = _progress_bar(current, target, length=bar_length, fill=bar_fill)
+
+    return (
+        f"`{bar}` **{percentage}%**\n"
+        f"🔹 {format_number(current)} / {format_number(target)}\n"
+        f"🔸 **{format_number(remaining)}** remaining"
+    )
+
+
+def create_orphanage_embed(orphanage):
+    """Notification embed for a new orphanage tier that just became
+    active — designed to stand out in the channel: title with the tier
+    name, thumbnail (if configured), a large progress bar, and an
+    'unlocked bonuses' box if the API data includes any."""
+    tier_name = orphanage.get("tier", {}).get("name", "Unknown Tier")
+    icon, status_label, _ = _orphanage_tier_visual(orphanage)
+
+    embed = discord.Embed(
+        title="🏠✨ New Orphanage Tier Active!",
+        description=(
+            f"## {icon} {tier_name}\n"
+            f"A new goal has kicked off for the guild's orphanage — "
+            f"let's get to it! 🎗️"
+        ),
+        color=COLOR_ORPHANAGE,
+    )
+
+    if ORPHANAGE_THUMBNAIL_URL:
+        embed.set_thumbnail(url=ORPHANAGE_THUMBNAIL_URL)
+
+    embed.add_field(
+        name="📊 Progress",
+        value=_safe_field_value(_orphanage_progress_block(orphanage)),
+        inline=False,
+    )
+    embed.add_field(name="🏷️ Status", value=f"**{status_label}**", inline=True)
+
+    effects = orphanage.get("effects") or orphanage.get("tier", {}).get("effects")
+    if effects:
+        embed.add_field(
+            name="✨ Tier Bonuses",
+            value=_safe_field_value(_bullet_list(effects)),
+            inline=True,
+        )
+
+    embed.add_field(
+        name="\u200b",
+        value=f"{DIVIDER}\n💚 Every contribution counts — thanks to everyone pitching in!",
+        inline=False,
+    )
+
+    return _finalize_embed(embed, "📣 Orphanage update")
+
+
+def create_orphanage_status_embed(tiers):
+    """Always-current status of ALL orphanage tiers, for the persistent
+    status message. Design goals:
+    - the active tier is called out right in the description;
+    - one tier per field with a status icon, colored bar, and numbers;
+    - the active tier is always shown first, then the rest in the API's
+      original order — so the most relevant info is always the first
+      thing you see, no scrolling needed.
+    """
+    embed = discord.Embed(
+        title="🏠 Orphanage Status",
+        color=COLOR_ORPHANAGE,
+    )
+
+    if ORPHANAGE_THUMBNAIL_URL:
+        embed.set_thumbnail(url=ORPHANAGE_THUMBNAIL_URL)
+
+    if not tiers:
+        embed.description = "😴 No orphanage data available right now."
+        return _finalize_embed(embed, "🔄 Live status — updates automatically")
+
+    active_tier = next((t for t in tiers if t.get("is_active")), None)
+
+    if active_tier:
+        active_name = active_tier.get("tier", {}).get("name", "Unknown Tier")
+        embed.description = f"🟢 Active tier: **{active_name}**"
+    else:
+        embed.description = "😴 No tier is currently active."
+
+    _add_divider(embed)
+
+    # Active tier always first, then the rest in the API's own order — so
+    # whoever reads the status immediately sees what matters most.
+    ordered_tiers = tiers
+    if active_tier:
+        ordered_tiers = [active_tier] + [t for t in tiers if t is not active_tier]
+
+    # Safety margin to stay under Discord's 25-field-per-embed hard limit:
+    # summary (description) + divider + N tiers + optional "and N more"
+    # row + the "Last Updated" field added at the end.
+    max_tier_fields = DISCORD_MAX_EMBED_FIELDS - 3
+    shown_tiers = ordered_tiers[:max_tier_fields]
+
+    for tier in shown_tiers:
+        tier_name = tier.get("tier", {}).get("name", "Unknown Tier")
+        icon, status_label, _ = _orphanage_tier_visual(tier)
+        is_active = tier.get("is_active", False)
+
+        # The active tier also stands out visually with a markdown quote
+        # border ("> ") on top of the icon, so it jumps out immediately
+        # in a list of several tiers.
+        field_name = f"{icon}  {tier_name}  •  {status_label}"
+        if is_active:
+            field_name = f"▶️ {field_name} ◀️"
+
+        value = _orphanage_progress_block(tier)
+        if is_active:
+            value = "\n".join(f"> {line}" for line in value.split("\n"))
+
+        embed.add_field(
+            name=field_name,
+            value=_safe_field_value(value),
+            inline=False,
+        )
+
+    remaining = len(ordered_tiers) - len(shown_tiers)
+    if remaining > 0:
+        embed.add_field(name="…", value=f"and {remaining} more tiers", inline=False)
+
+    return _finalize_embed(embed, "🔄 Live status — updates automatically")
+
+
+def _raid_duration_only(raid):
+    """The raid's total duration (expires_at - started_at) as a short
+    string like '8h', or None if either timestamp is missing/unparseable."""
+    started_ts = _iso_to_unix(raid.get("started_at"))
+    expires_ts = _iso_to_unix(raid.get("expires_at"))
+    if started_ts is None or expires_ts is None:
+        return None
+    return _format_duration(expires_ts - started_ts)
 
 
 def create_raid_embed(raid):
     embed = discord.Embed(
-        title="⚔️ Raid Started!",
-        description="A new guild raid has started!",
-        color=0xFF4444,
+        title="⚔️ Guild Raid Started!",
+        description="A new raid has begun — rally the guild!",
+        color=COLOR_RAID,
     )
 
     locations = raid.get("locations", [])
     embed.add_field(
-        name="📍 Locations",
-        value=_safe_field_value("\n".join(locations)) if locations else "Unknown",
-        inline=False,
+        name="📍 Locations", value=_safe_field_value(_bullet_list(locations)), inline=False
     )
 
-    embed.add_field(name="🗓️ Timing", value=_raid_duration_field_value(raid), inline=False)
+    embed.add_field(name="🕐 Started", value=parse_timestamp(raid.get("started_at")), inline=True)
+    embed.add_field(name="⏰ Expires", value=parse_timestamp(raid.get("expires_at")), inline=True)
 
-    expires = raid.get("expires_at")
-    embed.add_field(name="⏰ Expires", value=parse_timestamp(expires), inline=False)
+    duration = _raid_duration_only(raid)
+    if duration:
+        embed.add_field(name="⏳ Duration", value=f"**{duration}**", inline=True)
 
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-
-    return embed
+    return _finalize_embed(embed, "📣 New raid alert")
 
 
 def create_raid_reminder_embed(raid):
     embed = discord.Embed(
         title="⏰ Raid Expiring Soon!",
-        description="The current raid is about to expire — get in before it's gone!",
-        color=0xFFA500,
+        description="Time's almost up — get your hits in before it's gone!",
+        color=COLOR_RAID_WARNING,
     )
-    embed.add_field(
-        name="Expires", value=parse_timestamp(raid.get("expires_at")), inline=False
-    )
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-    return embed
+    embed.add_field(name="⌛ Expires", value=parse_timestamp(raid.get("expires_at")), inline=False)
+    return _finalize_embed(embed, "📣 Raid reminder")
 
 
 def create_raid_status_embed(raid):
@@ -1047,134 +1311,40 @@ def create_raid_status_embed(raid):
     if raid is None or not is_valid_raid(raid):
         embed = discord.Embed(
             title="⚔️ Raid Status",
-            description="ℹ️ No active guild raid right now.",
-            color=0x888888,
+            description="😴 No active guild raid right now.",
+            color=COLOR_NEUTRAL,
         )
     else:
-        embed = discord.Embed(title="⚔️ Raid Status", color=0xFF4444)
+        embed = discord.Embed(
+            title="⚔️ Raid Status",
+            description="🟢 A raid is currently active!",
+            color=COLOR_RAID,
+        )
         locations = raid.get("locations", [])
         embed.add_field(
-            name="📍 Locations",
-            value=_safe_field_value("\n".join(locations)) if locations else "Unknown",
-            inline=False,
+            name="📍 Locations", value=_safe_field_value(_bullet_list(locations)), inline=False
         )
-        embed.add_field(name="🗓️ Timing", value=_raid_duration_field_value(raid), inline=False)
         embed.add_field(
-            name="⏰ Expires", value=parse_timestamp(raid.get("expires_at")), inline=False
+            name="🕐 Started", value=parse_timestamp(raid.get("started_at")), inline=True
         )
-
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-    return embed
-
-
-def create_orphanage_embed(orphanage):
-    tier_name = orphanage.get("tier", {}).get("name", "Unknown Tier")
-
-    embed = discord.Embed(
-        title="🏠 Orphanage Active",
-        description=f"**{tier_name}** is now active!",
-        color=0x44FF44,
-    )
-
-    effects = orphanage.get("effects", [])
-    embed.add_field(
-        name="✨ Effects",
-        value=_safe_field_value("\n".join(effects)) if effects else "None",
-        inline=False,
-    )
-
-    current = orphanage.get("current_value", 0)
-    target = orphanage.get("target_value", 0)
-    remaining = orphanage.get("target_remaining", max(target - current, 0))
-    percentage = orphanage.get("percentage", 0)
-    embed.add_field(
-        name="📊 Progress",
-        value=f"{format_number(current)} / {format_number(target)} ({percentage}%)\n"
-        f"{format_number(remaining)} remaining",
-        inline=False,
-    )
-
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-
-    return embed
-
-
-def create_orphanage_status_embed(tiers):
-    """Always-current status of ALL orphanage tiers, for the persistent
-    status message — similar in spirit to Simple Wolf's own orphanage
-    status message (per-tier progress bars, absolute amounts remaining,
-    rewards, and currently active bonuses)."""
-    embed = discord.Embed(title="🏠 Orphanage Status", color=0x44FF44)
-
-    active_effects = []
-
-    for tier in tiers:
-        tier_name = tier.get("tier", {}).get("name", "Unknown Tier")
-        current = tier.get("current_value", 0)
-        target = tier.get("target_value", 0)
-        remaining = tier.get("target_remaining", max(target - current, 0))
-        percentage = tier.get("percentage", 0)
-        effects = tier.get("effects", [])
-        is_active = tier.get("is_active", False)
-
-        if is_active:
-            status_icon = "🟢"
-            status_label = "Active"
-            active_effects = effects
-        elif tier.get("has_expired"):
-            status_icon = "⌛"
-            status_label = "Expired"
-        elif percentage >= 100 or tier.get("goal_reached_at"):
-            status_icon = "✅"
-            status_label = "Goal Reached"
-        elif tier.get("in_progress"):
-            status_icon = "🔻"
-            status_label = "In Progress"
-        else:
-            status_icon = "⚙️"
-            status_label = "Not Started"
-
-        bar, _ = _progress_bar(current, target)
-        value_lines = [
-            f"**{status_label}**",
-            f"{bar} {percentage}%",
-            f"{format_number(current)} of {format_number(target)} "
-            f"({format_number(remaining)} remaining)",
-        ]
-        if effects:
-            value_lines.append("Rewards: " + ", ".join(effects))
-
         embed.add_field(
-            name=f"{status_icon} {tier_name}",
-            value=_safe_field_value("\n".join(value_lines)),
-            inline=False,
+            name="⏰ Expires", value=parse_timestamp(raid.get("expires_at")), inline=True
         )
+        duration = _raid_duration_only(raid)
+        if duration:
+            embed.add_field(name="⏳ Duration", value=f"**{duration}**", inline=True)
 
-    embed.add_field(
-        name="✨ Current Active Bonuses",
-        value=_safe_field_value("\n".join(active_effects)) if active_effects else "None",
-        inline=False,
-    )
-
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-
-    return embed
+    return _finalize_embed(embed, "🔄 Live status — updates automatically")
 
 
-def format_number(n):
-    """Abbreviates large numbers for readability while keeping the exact
-    value visible, e.g. 1,234,567 -> '1.2M (1,234,567)'."""
-    n = n or 0
-    if n >= 1_000_000_000:
-        return f"{n / 1_000_000_000:.1f}B ({n:,})"
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M ({n:,})"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K ({n:,})"
-    return f"{n:,}"
+def _progress_bar(current, target, length=12, fill="🟩", empty="⬛"):
+    """Colorful square-emoji progress bar — reads much better in Discord
+    than plain ASCII block characters. `fill` lets callers match each
+    feature's accent color (e.g. red for HP, blue for guild tasks)."""
+    pct = 0 if not target else min(100, max(0, int(current / target * 100)))
+    filled = min(length, round(length * pct / 100))
+    bar = fill * filled + empty * (length - filled)
+    return bar, pct
 
 
 def create_worldboss_embed(boss, killed=False):
@@ -1184,28 +1354,25 @@ def create_worldboss_embed(boss, killed=False):
     if killed:
         embed = discord.Embed(
             title="💀 World Boss Defeated!",
-            description=f"**{name}** (Lv. {level}) has been taken down!",
-            color=0x888888,
+            description=f"**{name}** (Lv. {level}) has fallen. GG!",
+            color=COLOR_WORLDBOSS_DEFEATED,
         )
     else:
         embed = discord.Embed(
             title="🔥 World Boss Active!",
-            description=f"**{name}** (Lv. {level}) is now available!",
-            color=0xFF8800,
+            description=f"**{name}** (Lv. {level}) has spawned — go get it!",
+            color=COLOR_WORLDBOSS,
         )
         hp = boss.get("current_hp", 0)
         max_hp = boss.get("max_hp", 0)
-        pct = int(hp / max_hp * 100) if max_hp else 0
+        bar, pct = _progress_bar(hp, max_hp, fill="🟥")
         embed.add_field(
             name="❤️ HP",
-            value=f"{format_number(hp)} / {format_number(max_hp)} ({pct}%)",
+            value=f"{bar} **{pct}%**\n{format_number(hp)} / {format_number(max_hp)}",
             inline=False,
         )
 
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-
-    return embed
+    return _finalize_embed(embed, "📣 World boss update")
 
 
 def create_worldboss_incoming_embed(boss):
@@ -1216,85 +1383,73 @@ def create_worldboss_incoming_embed(boss):
 
     embed = discord.Embed(
         title="⏳ World Boss Incoming!",
-        description=f"**{name}** (Lv. {level}) will spawn soon!",
-        color=0xFFA500,
+        description=f"**{name}** (Lv. {level}) is about to spawn — get ready!",
+        color=COLOR_RAID_WARNING,
     )
     embed.add_field(
         name="🕐 Spawns", value=format_unix_relative(enable_time), inline=False
     )
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-    return embed
-
-
-def _progress_bar(current, target, length=20):
-    pct = 0 if not target else min(100, int(current / target * 100))
-    filled = int(length * pct / 100)
-    bar = "█" * filled + "░" * (length - filled)
-    return bar, pct
+    return _finalize_embed(embed, "📣 World boss reminder")
 
 
 def create_guild_task_embed(task, completed=False):
     task_type = str(task.get("type", "Unknown")).capitalize()
     exp_reward = task.get("exp_reward", 0)
     pp_reward = task.get("power_point_reward", 0)
+    target = task.get("target_amount", 0)
 
     if completed:
         embed = discord.Embed(
             title="✅ Guild Task Completed!",
-            description=f"The **{task_type}** task has been completed!",
-            color=0x44FF44,
+            description=f"The **{task_type}** task is done — nice work, guild!",
+            color=COLOR_GUILD_TASK_COMPLETE,
+        )
+        embed.add_field(
+            name="🎯 Final Tally", value=f"{target:,} / {target:,} (**100%**)", inline=False
         )
     else:
         embed = discord.Embed(
             title="📋 New Guild Task!",
             description=f"Type: **{task_type}**",
-            color=0x4488FF,
+            color=COLOR_GUILD_TASK,
         )
         current = task.get("current_amount", 0)
-        target = task.get("target_amount", 0)
-        bar, pct = _progress_bar(current, target)
-        embed.add_field(name="🎯 Target", value=f"{target:,}", inline=False)
+        bar, pct = _progress_bar(current, target, fill="🟦")
         embed.add_field(
             name="📊 Progress",
-            value=f"{current:,} / {target:,} ({pct}%)\n{bar}",
+            value=f"{bar} **{pct}%**\n{current:,} / {target:,}",
             inline=False,
         )
 
     embed.add_field(
         name="🎁 Reward",
-        value=f"{format_number(exp_reward)} EXP + {format_number(pp_reward)} Power Points",
+        value=f"{format_number(exp_reward)} EXP  •  {format_number(pp_reward)} Power Points",
         inline=False,
     )
 
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-
-    return embed
+    return _finalize_embed(embed, "📣 Guild task update")
 
 
 def create_guild_task_status_embed(task):
     task_type = str(task.get("type", "Unknown")).capitalize()
     current = task.get("current_amount", 0)
     target = task.get("target_amount", 0)
-    bar, pct = _progress_bar(current, target)
+    bar, pct = _progress_bar(current, target, fill="🟦")
 
-    embed = discord.Embed(title="📋 Guild Task Status", color=0x4488FF)
-    embed.add_field(name="Type", value=task_type, inline=False)
+    embed = discord.Embed(title="📋 Guild Task Status", color=COLOR_GUILD_TASK)
+    embed.add_field(name="Type", value=f"**{task_type}**", inline=True)
+    embed.add_field(name="Progress", value=f"**{pct}%**", inline=True)
     embed.add_field(
-        name="Progress", value=f"{current:,} / {target:,} ({pct}%)", inline=False
+        name="📊 Progress Bar", value=f"{bar}\n{current:,} / {target:,}", inline=False
     )
-    embed.add_field(name="Bar", value=bar, inline=False)
     embed.add_field(
         name="🎁 Reward",
-        value=f"{format_number(task.get('exp_reward', 0))} EXP + {format_number(task.get('power_point_reward', 0))} Power Points",
+        value=f"{format_number(task.get('exp_reward', 0))} EXP  •  "
+        f"{format_number(task.get('power_point_reward', 0))} Power Points",
         inline=False,
     )
 
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-
-    return embed
+    return _finalize_embed(embed, "🔄 Live status — updates automatically")
 
 
 def create_guild_task_status_embed_safe(task):
@@ -1305,12 +1460,10 @@ def create_guild_task_status_embed_safe(task):
     if not is_valid_guild_task(task):
         embed = discord.Embed(
             title="📋 Guild Task Status",
-            description="ℹ️ No active guild task right now.",
-            color=0x888888,
+            description="😴 No active guild task right now.",
+            color=COLOR_NEUTRAL,
         )
-        embed.set_footer(text="SimpleMMO Monitor")
-        embed.timestamp = datetime.now(timezone.utc)
-        return embed
+        return _finalize_embed(embed, "🔄 Live status — updates automatically")
 
     return create_guild_task_status_embed(task)
 
@@ -1321,20 +1474,16 @@ def create_sanctuary_active_embed(tier):
     embed = discord.Embed(
         title="🏛️ Sanctuary Tier Active!",
         description=f"**{tier_name}** is now the active guild sanctuary tier!",
-        color=0x44FF44,
+        color=COLOR_SANCTUARY,
     )
 
-    effects = tier.get("effects", [])
     embed.add_field(
-        name="✨ Effects",
-        value=_safe_field_value("\n".join(effects)) if effects else "None",
+        name="✨ Active Bonuses",
+        value=_safe_field_value(_bullet_list(tier.get("effects", []))),
         inline=False,
     )
 
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-
-    return embed
+    return _finalize_embed(embed, "📣 Sanctuary update")
 
 
 def create_sanctuary_completed_embed(tier):
@@ -1344,63 +1493,59 @@ def create_sanctuary_completed_embed(tier):
 
     embed = discord.Embed(
         title="🏆 Sanctuary Tier Completed!",
-        description=f"**{tier_name}** has reached its goal!",
-        color=0xFFD700,
+        description=f"**{tier_name}** has reached its goal — well done, guild!",
+        color=COLOR_SANCTUARY_COMPLETE,
     )
 
-    embed.add_field(name="🎯 Target", value=f"{target:,}", inline=False)
-    embed.add_field(name="📊 Reached", value=f"{current:,} / {target:,}", inline=False)
-
-    effects = tier.get("effects", [])
     embed.add_field(
-        name="✨ Effects Unlocked",
-        value=_safe_field_value("\n".join(effects)) if effects else "None",
+        name="🎯 Final Tally",
+        value=f"{format_number(current)} / {format_number(target)} (**100%**)",
         inline=False,
     )
 
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
+    embed.add_field(
+        name="✨ Effects Unlocked",
+        value=_safe_field_value(_bullet_list(tier.get("effects", []))),
+        inline=False,
+    )
 
-    return embed
+    return _finalize_embed(embed, "📣 Sanctuary update")
 
 
 def create_sanctuary_status_embed(tiers):
-    embed = discord.Embed(title="🏛️ Guild Sanctuary Status", color=0x4488FF)
+    embed = discord.Embed(title="🏛️ Guild Sanctuary Status", color=COLOR_SANCTUARY)
 
     for tier in tiers:
         tier_name = tier.get("tier", {}).get("name", "Unknown Tier")
         current = tier.get("current_value", 0)
         target = tier.get("target_value", 0)
         pct = tier.get("percentage", 0)
-        bar, _ = _progress_bar(current, target)
+        bar, _ = _progress_bar(current, target, fill="🟪")
 
-        status_bits = []
         if tier.get("is_active"):
-            status_bits.append("🟢 Active")
-        if tier.get("has_expired"):
-            status_bits.append("⌛ Expired")
+            status_icon, status_label = "🟢", "Active"
+        elif tier.get("has_expired"):
+            status_icon, status_label = "⌛", "Expired"
+        elif tier.get("goal_reached_at") or pct >= 100:
+            status_icon, status_label = "✅", "Goal Reached"
         elif tier.get("in_progress"):
-            status_bits.append("🔨 In progress")
-        elif tier.get("goal_reached_at"):
-            status_bits.append("✅ Goal reached")
-        status = " · ".join(status_bits) if status_bits else "—"
+            status_icon, status_label = "🔨", "In Progress"
+        else:
+            status_icon, status_label = "⚙️", "Not Started"
 
         value_lines = [
-            status,
-            f"{current:,} / {target:,} ({pct}%)",
-            bar,
+            f"*{status_label}*",
+            f"{bar} **{pct}%**",
+            f"{current:,} / {target:,}",
         ]
 
         embed.add_field(
-            name=tier_name,
+            name=f"{status_icon}  {tier_name}",
             value=_safe_field_value("\n".join(value_lines)),
             inline=False,
         )
 
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-
-    return embed
+    return _finalize_embed(embed, "🔄 Live status — updates automatically")
 
 
 def create_auth_failure_embed(count, endpoint):
@@ -1408,14 +1553,12 @@ def create_auth_failure_embed(count, endpoint):
         title="🚨 API Authentication Failing",
         description=(
             f"The bot has failed to authenticate with the SimpleMMO API "
-            f"on `{endpoint}` {count} times in a row. The API key may be "
+            f"on `{endpoint}` **{count} times in a row**. The API key may be "
             f"invalid or expired — please check the `.env` configuration."
         ),
-        color=0xFF0000,
+        color=COLOR_ERROR,
     )
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-    return embed
+    return _finalize_embed(embed, "🚨 Action required")
 
 
 # ==========================================================
@@ -1524,21 +1667,56 @@ async def _monitor_tick():
             create_orphanage_status_embed(orphanage_tiers),
         )
 
-    # NOTE: `boss_activated` is intentionally NOT used to send a "World Boss
-    # Active" notification anymore. The only "boss is starting" notification
-    # is the `boss_incoming` one below, sent WORLDBOSS_REMINDER_SECONDS_BEFORE
-    # seconds before the boss actually spawns. `boss_activated` is still
-    # returned by check_worldboss() because it's needed internally to detect
-    # the "killed" transition correctly.
-    _boss_activated, boss_killed, boss_incoming, bosses = await check_worldboss()
+    boss_activated, boss_killed, boss_incoming, bosses = await check_worldboss()
+
+    for boss in boss_activated:
+        logger.info(f"World boss activated: {boss.get('name')}")
+        boss_id = str(boss.get("id"))
+        # No flat expiry here — this notification is deleted PRECISELY when
+        # this same boss is confirmed killed, below. The long expire_seconds
+        # is just a safety net in case that boss somehow never registers as
+        # killed (e.g. it gets reset/removed by the API without ever
+        # hitting 0 HP), so it doesn't linger forever either way.
+        message = await send_notification(
+            channels,
+            WORLDBOSS_CHANNEL_ID,
+            embed=create_worldboss_embed(boss, killed=False),
+            expire_seconds=24 * 60 * 60,
+        )
+        if message is not None:
+            worldboss_active_notification_ids[boss_id] = {
+                "channel_id": WORLDBOSS_CHANNEL_ID,
+                "message_id": message.id,
+            }
+            persist_state()
+
     for boss in boss_killed:
         logger.info(f"World boss killed: {boss.get('name')}")
+        boss_id = str(boss.get("id"))
+
+        # Remove the earlier "Active" notification for this exact boss right
+        # now — it's stale info (old HP, "go get it!") the instant the boss
+        # is dead, so there's no reason to wait for its own timer.
+        stale = worldboss_active_notification_ids.pop(boss_id, None)
+        if stale:
+            stale_channel = channels.get(stale["channel_id"])
+            if stale_channel is not None:
+                try:
+                    stale_message = await stale_channel.fetch_message(stale["message_id"])
+                    await stale_message.delete()
+                except discord.NotFound:
+                    pass  # already gone somehow — fine
+                except discord.HTTPException as e:
+                    logger.warning(f"Failed to delete stale 'boss active' notification: {e}")
+            persist_state()
+
         await send_notification(
             channels,
             WORLDBOSS_CHANNEL_ID,
             embed=create_worldboss_embed(boss, killed=True),
             expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
         )
+
     if boss_incoming:
         logger.info(f"World boss incoming soon: {boss_incoming.get('name')}")
         # Expires the moment the boss actually spawns — by then the
@@ -1659,8 +1837,12 @@ async def on_ready():
 
 @bot.event
 async def on_disconnect():
-    await close_session()
-    logger.info("Session closed on disconnect")
+    # FIX: on_disconnect fires on ANY gateway disconnect, including
+    # transient ones discord.py auto-reconnects from — not just real
+    # shutdown. Closing the shared aiohttp session here could kill
+    # in-flight SimpleMMO API requests for no reason. The session is
+    # already closed properly in _graceful_shutdown() on real shutdown.
+    logger.warning("Disconnected from Discord gateway (will attempt to reconnect automatically)")
 
 
 @bot.tree.error
@@ -1812,32 +1994,65 @@ async def task_command(interaction: discord.Interaction):
 
 
 def create_worldboss_status_embed(bosses, now=None):
-    """Always-current status of world bosses (active ones + next upcoming
-    spawn), shared by both the /worldboss command and the persistent status
-    message so the two never drift apart."""
+    """Always-current status of world bosses (all active ones + ALL
+    upcoming spawns, not just the next one), shared by both the /worldboss
+    command and the persistent status message so the two never drift
+    apart."""
     if now is None:
         now = time.time()
 
     active_bosses = [b for b in bosses if is_boss_active(b, now)]
+    # Show every upcoming boss, not just the immediate next one — several
+    # can be scheduled across the week.
+    upcoming_bosses = get_upcoming_worldbosses(bosses, now, limit=10)
+
+    if not bosses:
+        # The API returned no boss data at all — most likely this week's
+        # bosses have already all been cleared and a new batch hasn't been
+        # posted yet, rather than an error (a real failure never reaches
+        # here — see check_worldboss).
+        embed = discord.Embed(
+            title="🔥 World Bosses",
+            description=(
+                "😴 No world boss data available right now.\n"
+                "This usually means this week's bosses have all already "
+                "been cleared — a new batch should appear later."
+            ),
+            color=COLOR_NEUTRAL,
+        )
+        return _finalize_embed(embed, "🔄 Live status — updates automatically")
+
+    if not active_bosses and not upcoming_bosses:
+        embed = discord.Embed(
+            title="🔥 World Bosses",
+            description=(
+                "😴 No world boss is active or scheduled right now — looks "
+                "like this week's bosses have all been cleared."
+            ),
+            color=COLOR_NEUTRAL,
+        )
+        return _finalize_embed(embed, "🔄 Live status — updates automatically")
 
     if not active_bosses:
-        embed = discord.Embed(title="🔥 World Bosses", color=0xFF8800)
-        embed.add_field(
-            name="Status", value="ℹ️ No world boss is currently active.", inline=False
+        embed = discord.Embed(
+            title="🔥 World Bosses",
+            description="😴 No world boss is currently active.",
+            color=COLOR_NEUTRAL,
         )
     else:
-        embed = discord.Embed(title="🔥 Active World Bosses", color=0xFF8800)
-        # Leave room for the "Next World Boss" field below, and stay safely
+        embed = discord.Embed(title="🔥 Active World Bosses", color=COLOR_WORLDBOSS)
+        # Leave room for the upcoming-bosses field, the divider, and the
+        # "Last Updated" field added by _finalize_embed — and stay safely
         # under Discord's 25-field-per-embed hard limit.
-        max_active_fields = DISCORD_MAX_EMBED_FIELDS - 2
+        max_active_fields = DISCORD_MAX_EMBED_FIELDS - 3
         for boss in active_bosses[:max_active_fields]:
             hp = boss.get("current_hp", 0)
             max_hp = boss.get("max_hp", 1)
-            pct = int(hp / max_hp * 100) if max_hp else 0
+            bar, pct = _progress_bar(hp, max_hp, length=10, fill="🟥")
             embed.add_field(
-                name=f"{boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
+                name=f"⚔️ {boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
                 value=_safe_field_value(
-                    f"HP: {format_number(hp)} / {format_number(max_hp)} ({pct}%)"
+                    f"{bar} **{pct}%**\n{format_number(hp)} / {format_number(max_hp)}"
                 ),
                 inline=False,
             )
@@ -1847,22 +2062,22 @@ def create_worldboss_status_embed(bosses, now=None):
                 name="…", value=f"and {remaining} more active", inline=False
             )
 
-    # Always show the next upcoming boss countdown too, if there is one.
-    next_boss = get_upcoming_worldboss(bosses, now)
-    if next_boss:
+    # Always show ALL upcoming (not-yet-spawned) bosses, not just one.
+    if upcoming_bosses:
+        if active_bosses:
+            _add_divider(embed)
+        lines = [
+            f"**{b.get('name', 'Unknown')}** (Lv. {b.get('level', '?')}) "
+            f"— spawns {format_unix_relative(b.get('enable_time'))}"
+            for b in upcoming_bosses
+        ]
         embed.add_field(
-            name="⏳ Next World Boss",
-            value=_safe_field_value(
-                f"{next_boss.get('name', 'Unknown')} (Lv. {next_boss.get('level', '?')}) "
-                f"— spawns {format_unix_relative(next_boss.get('enable_time'))}"
-            ),
+            name=f"⏳ Upcoming World Bosses ({len(upcoming_bosses)})",
+            value=_safe_field_value("\n".join(lines)),
             inline=False,
         )
 
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-
-    return embed
+    return _finalize_embed(embed, "🔄 Live status — updates automatically")
 
 
 @bot.tree.command(name="worldboss", description="Show active world bosses")
@@ -1919,43 +2134,44 @@ async def next_bosses_command(
         return
 
     embed = discord.Embed(
-        title=f"⏳ Upcoming World Bosses ({len(upcoming)})", color=0xFFA500
+        title=f"⏳ Upcoming World Bosses ({len(upcoming)})", color=COLOR_RAID_WARNING
     )
     for boss in upcoming:
         embed.add_field(
-            name=f"{boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
+            name=f"⚔️ {boss.get('name', 'Unknown')} (Lv. {boss.get('level', '?')})",
             value=_safe_field_value(
                 f"Spawns {format_unix_relative(boss.get('enable_time'))}"
             ),
             inline=False,
         )
-    embed.set_footer(text="SimpleMMO Monitor")
-    embed.timestamp = datetime.now(timezone.utc)
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=_finalize_embed(embed))
 
 
 @bot.tree.command(name="status", description="Show bot status")
 async def status(interaction: discord.Interaction):
     _prune_request_times()
     requests_count = len(request_times)
+    bar, _ = _progress_bar(requests_count, MAX_REQUESTS_PER_MINUTE, length=10, fill="🟦")
 
-    embed = discord.Embed(title="🤖 SimpleMMO Bot Status", color=0x4444FF)
+    embed = discord.Embed(
+        title="🤖 SimpleMMO Bot Status",
+        description="🟢 Online and monitoring",
+        color=COLOR_GUILD_TASK,
+    )
 
-    embed.add_field(name="Status", value="🟢 Online", inline=False)
-    embed.add_field(name="Guild ID", value=str(GUILD_ID), inline=False)
+    embed.add_field(name="Guild ID", value=f"`{GUILD_ID}`", inline=True)
+    if last_check_time:
+        embed.add_field(
+            name="Last Check", value=f"<t:{int(last_check_time)}:R>", inline=True
+        )
+
     embed.add_field(
-        name="API Requests (last minute)",
-        value=f"{requests_count}/{MAX_REQUESTS_PER_MINUTE}",
+        name="📡 API Requests (last minute)",
+        value=f"{bar} **{requests_count}/{MAX_REQUESTS_PER_MINUTE}**",
         inline=False,
     )
 
-    if last_check_time:
-        embed.add_field(
-            name="Last Check", value=f"<t:{int(last_check_time)}:R>", inline=False
-        )
-
-    embed.timestamp = datetime.now(timezone.utc)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=_finalize_embed(embed))
 
 
 @bot.tree.command(name="uptime", description="Show how long the bot has been running")
