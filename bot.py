@@ -18,10 +18,12 @@ import tempfile
 import time
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, time as dt_time
 from collections import deque
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # ==========================================================
 # CONFIGURATION
@@ -32,7 +34,6 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 API_KEY = os.getenv("API_KEY")
 GUILD_ID_RAW = os.getenv("GUILD_ID")
-RAID_ROLE_ID_RAW = os.getenv("RAID_ROLE_ID")  # optional: role to ping on raids
 
 # Robust environment variable validation
 errors = []
@@ -55,14 +56,6 @@ else:
 
 if errors:
     raise ValueError("\n".join(errors))
-
-# RAID_ROLE_ID is optional: if missing or invalid, no role is pinged
-RAID_ROLE_ID = None
-if RAID_ROLE_ID_RAW:
-    try:
-        RAID_ROLE_ID = int(RAID_ROLE_ID_RAW)
-    except ValueError:
-        RAID_ROLE_ID = None
 
 
 def _parse_optional_channel_id(env_var_name):
@@ -94,6 +87,7 @@ ORPHANAGE_CHANNEL_ID = _parse_optional_channel_id("ORPHANAGE_CHANNEL_ID") or CHA
 GUILD_TASK_CHANNEL_ID = _parse_optional_channel_id("GUILD_TASK_CHANNEL_ID") or CHANNEL_ID
 SANCTUARY_CHANNEL_ID = _parse_optional_channel_id("SANCTUARY_CHANNEL_ID") or CHANNEL_ID
 ERROR_ALERT_CHANNEL_ID = _parse_optional_channel_id("ERROR_ALERT_CHANNEL_ID") or CHANNEL_ID
+VAULT_CHANNEL_ID = _parse_optional_channel_id("VAULT_CHANNEL_ID") or CHANNEL_ID
 
 # Unlike the others, COMMANDS_CHANNEL_ID has NO fallback: None means "no
 # restriction", i.e. slash commands can be used anywhere the bot has
@@ -112,6 +106,7 @@ _required_channels = {
     "GUILD_TASK_CHANNEL_ID": GUILD_TASK_CHANNEL_ID,
     "SANCTUARY_CHANNEL_ID": SANCTUARY_CHANNEL_ID,
     "ERROR_ALERT_CHANNEL_ID": ERROR_ALERT_CHANNEL_ID,
+    "VAULT_CHANNEL_ID": VAULT_CHANNEL_ID,
 }
 _channel_errors = [
     f"{name} missing: set {name} specifically, or set the general CHANNEL_ID as a fallback"
@@ -120,6 +115,59 @@ _channel_errors = [
 ]
 if _channel_errors:
     raise ValueError("\n".join(_channel_errors))
+
+# Where pending /vault submissions are posted for admin review (with the
+# Approve/Reject buttons), as opposed to VAULT_CHANNEL_ID above (where the
+# APPROVED code eventually gets published). Falls back to
+# ERROR_ALERT_CHANNEL_ID — which is guaranteed to be a valid channel ID by
+# this point, since the required-channels check above already passed — so
+# review requests land in the same "admin operations" channel as auth
+# alerts by default, without forcing you to configure yet another channel
+# just for this. Set VAULT_REVIEW_CHANNEL_ID explicitly if you'd rather
+# keep vault reviews separate from error alerts.
+VAULT_REVIEW_CHANNEL_ID = _parse_optional_channel_id("VAULT_REVIEW_CHANNEL_ID") or ERROR_ALERT_CHANNEL_ID
+
+# Optional per-feature roles to ping when a status message is briefly
+# "highlighted" (see the highlight system further down) — e.g. pinging
+# @Raiders the moment a raid starts. Same env-var parsing rules as channel
+# IDs (missing/invalid just means "don't ping anyone" for that feature, not
+# a hard failure), so _parse_optional_channel_id is reused here too despite
+# the name — it's really just "parse optional integer ID from env".
+RAID_ROLE_ID = _parse_optional_channel_id("RAID_ROLE_ID")
+GUILD_TASK_ROLE_ID = _parse_optional_channel_id("GUILD_TASK_ROLE_ID")
+ORPHANAGE_ROLE_ID = _parse_optional_channel_id("ORPHANAGE_ROLE_ID")
+SANCTUARY_ROLE_ID = _parse_optional_channel_id("SANCTUARY_ROLE_ID")
+WORLDBOSS_ROLE_ID = _parse_optional_channel_id("WORLDBOSS_ROLE_ID")
+
+# Role allowed to Approve/Reject a pending /vault submission. If unset,
+# anyone with the "Manage Server" (or Administrator) permission can review
+# submissions instead — see _can_review_vault below — so this feature works
+# out of the box without forcing a dedicated role to be created first.
+VAULT_REVIEWER_ROLE_ID = _parse_optional_channel_id("VAULT_REVIEWER_ROLE_ID")
+
+# Optional role to ping (once, on the vault status message) when a new
+# code gets approved — same pattern as RAID_ROLE_ID etc.
+VAULT_ROLE_ID = _parse_optional_channel_id("VAULT_ROLE_ID")
+
+# How long a RESOLVED vault submission (approved/rejected/expired/
+# superseded) is kept in bot_state.json before being cleaned up (see
+# _cleanup_old_vault_submissions). Without this, vault_submissions would
+# grow forever — every code ever posted, kept indefinitely, even though
+# only the most recent ones are ever relevant. Still-pending submissions
+# are never removed by this regardless of age (they should only ever
+# leave "pending" via a review or the daily reset expiring them).
+VAULT_SUBMISSION_RETENTION_DAYS = int(os.getenv("VAULT_SUBMISSION_RETENTION_DAYS", "7"))
+VAULT_SUBMISSION_RETENTION_SECONDS = VAULT_SUBMISSION_RETENTION_DAYS * 24 * 60 * 60
+
+# What time of day the vault code resets in-game, so the bot knows when to
+# clear the current code and go back to "not found yet" for the new day.
+# There is no known SimpleMMO API endpoint that exposes this (unlike raid
+# expiry or boss enable_time, which come straight from the API) — it's a
+# fixed daily wall-clock time, so it's configured here instead. If the
+# in-game reset time ever changes, update these two values rather than
+# expecting the bot to detect it automatically.
+VAULT_RESET_TIME = os.getenv("VAULT_RESET_TIME", "13:53")  # 24h HH:MM
+VAULT_RESET_TIMEZONE = os.getenv("VAULT_RESET_TIMEZONE", "Europe/Rome")  # IANA tz name
 
 
 # ==========================================================
@@ -149,7 +197,17 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
-_json_handler_file = logging.FileHandler("bot.log")
+# Rotating instead of a plain FileHandler: without a cap, bot.log grows
+# forever over months of uptime. Size and backup count are configurable via
+# .env in case you want more/less history; defaults keep at most ~50MB of
+# logs on disk (10MB active file + 4 rotated backups).
+LOG_FILE = os.getenv("LOG_FILE", "bot.log")
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB
+LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "4"))
+
+_json_handler_file = RotatingFileHandler(
+    LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+)
 _json_handler_file.setFormatter(JsonFormatter())
 
 _plain_handler_stream = logging.StreamHandler()
@@ -167,7 +225,21 @@ logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Explicit rather than relying on discord.py's implicit default: guarantees
+# role mentions (used for RAID_ROLE_ID, GUILD_TASK_ROLE_ID,
+# ORPHANAGE_ROLE_ID, SANCTUARY_ROLE_ID, VAULT_ROLE_ID — see
+# _role_ping_content) are never silently suppressed by the library, while
+# still blocking accidental @everyone/@here pings. Note this only controls
+# whether Discord *would* notify the role if a mention is present in
+# `content` — it does NOT override the two server-side settings that
+# actually gate whether a role ping notifies anyone at all: the role's own
+# "Allow anyone to mention this role" toggle, and the bot's "Mention
+# @everyone, @here, and All Roles" permission in that channel. See
+# _check_role_ping_configuration below, which checks exactly those two
+# things at startup and logs a warning if either is missing.
+_ALLOWED_MENTIONS = discord.AllowedMentions(everyone=False, roles=True, users=True, replied_user=False)
+
+bot = commands.Bot(command_prefix="!", intents=intents, allowed_mentions=_ALLOWED_MENTIONS)
 
 
 async def _resolve_text_channel(channel_id):
@@ -205,6 +277,56 @@ async def resolve_notification_channels(channel_ids):
         if channel is not None:
             resolved[cid] = channel
     return resolved
+
+
+async def _check_role_ping_configuration():
+    """Startup diagnostic for the most common reason a configured role
+    ping "doesn't work" even though the code sends it correctly: a
+    <@&role_id> mention in `content` only actually notifies anyone if
+    EITHER the role has "Allow anyone to mention this role" enabled
+    (Server Settings > Roles), OR the bot has the "Mention @everyone,
+    @here, and All Roles" permission in that specific channel. If neither
+    is true, Discord silently renders the mention as plain, non-notifying
+    text — no error, no exception, nothing to catch in code — so this
+    checks both conditions for every configured *_ROLE_ID and logs a
+    specific warning naming exactly what to fix, instead of leaving it to
+    be discovered by "the ping just doesn't happen"."""
+    role_configs = [
+        ("RAID_ROLE_ID", RAID_ROLE_ID, RAID_CHANNEL_ID),
+        ("GUILD_TASK_ROLE_ID", GUILD_TASK_ROLE_ID, GUILD_TASK_CHANNEL_ID),
+        ("ORPHANAGE_ROLE_ID", ORPHANAGE_ROLE_ID, ORPHANAGE_CHANNEL_ID),
+        ("SANCTUARY_ROLE_ID", SANCTUARY_ROLE_ID, SANCTUARY_CHANNEL_ID),
+        ("WORLDBOSS_ROLE_ID", WORLDBOSS_ROLE_ID, WORLDBOSS_CHANNEL_ID),
+        ("VAULT_ROLE_ID", VAULT_ROLE_ID, VAULT_CHANNEL_ID),
+    ]
+
+    for env_name, role_id, channel_id in role_configs:
+        if role_id is None:
+            continue
+
+        channel = await _resolve_text_channel(channel_id)
+        if channel is None:
+            # Already logged by _resolve_text_channel itself — nothing
+            # extra to add here, the role check can't proceed without it.
+            continue
+
+        role = channel.guild.get_role(role_id)
+        if role is None:
+            logger.warning(
+                f"{env_name} ({role_id}) doesn't match any role in "
+                f"'{channel.guild.name}' — double-check the role ID."
+            )
+            continue
+
+        bot_perms = channel.permissions_for(channel.guild.me)
+        if not role.mentionable and not bot_perms.mention_everyone:
+            logger.warning(
+                f"{env_name} (@{role.name}) is configured but likely won't actually "
+                f"notify anyone: the role isn't set as mentionable, and the bot doesn't "
+                f"have the 'Mention @everyone, @here, and All Roles' permission in "
+                f"#{channel.name}. Fix either one in Discord's settings — no code/env "
+                f"change needed for this."
+            )
 
 
 async def send_notification(channels, channel_id, expire_at=None, expire_seconds=None, **kwargs):
@@ -286,9 +408,19 @@ last_raid_started = _state.get("last_raid_started")
 last_orphanage = _state.get("last_orphanage")
 last_worldboss = _state.get(
     "last_worldboss", {}
-)  # {boss_id: {"active": bool, "hp": int}}
+)  # {boss_id: {"active": bool, "hp": int, "name": str, "avatar": str}}
 last_guild_task_key = _state.get("last_guild_task_key")  # e.g. "travel:30000"
 guild_task_completed_notified = _state.get("guild_task_completed_notified", False)
+
+# Generic "highlight window" tracking, shared by every feature whose status
+# message briefly changes appearance (different title/color, and a one-off
+# role ping) right after something happens — e.g. a raid starting, a task
+# completing, a new orphanage tier, a sanctuary tier finishing — instead of
+# spamming a separate notification message that has to be tracked and
+# cleaned up on its own. Keyed by feature name -> {"kind": <event kind
+# string, feature-specific>, "until": <unix ts to revert by>}. See
+# _set_highlight() / _active_highlight() below for how it's used.
+status_highlights = _state.get("status_highlights", {})
 
 last_check_time = None
 bot_start_time = time.time()
@@ -298,19 +430,25 @@ bot_start_time = time.time()
 # restart that happened to land near an event.
 raid_reminder_sent = _state.get("raid_reminder_sent", False)
 RAID_REMINDER_MINUTES_BEFORE = 10  # how long before expiry to warn
-
-# How long the "raid started" ping notification stays visible before being
-# auto-deleted. Deliberately short — it's just a quick heads-up that
-# something happened; the persistent "Raid Status" message (edited in
-# place, see create_raid_status_embed) already shows the full up-to-date
-# details for as long as the raid stays active, so this one doesn't need
-# to linger for hours like it used to. Note actual deletion only happens
-# on the next monitor tick after this many seconds pass (see
-# cleanup_expired_notifications), so with the default 60s monitor
-# interval it'll realistically vanish within roughly a minute, not
-# instantly.
-RAID_START_NOTIFICATION_LIFETIME_SECONDS = 30
 no_raid_logged = _state.get("no_raid_logged", False)  # avoids logging "no active raid" on every single check
+
+# How long each feature's status message stays "highlighted" (different
+# title/color, plus a one-off role ping — see _set_highlight/_role_ping_content)
+# after something happens, before reverting to its plain look. Chosen per
+# feature based on how long that highlight stays meaningful: a raid just
+# starting is only "new" for a little while relative to its own duration
+# (see _raid_highlight_duration below, which scales with each individual
+# raid instead of using a flat constant), whereas orphanage/sanctuary tiers
+# are especially important and stay relevant for a large chunk of the day,
+# so they get the longest highlight window; guild tasks sit in between.
+RAID_HIGHLIGHT_FALLBACK_SECONDS = 10 * 60  # used only if raid timestamps are missing/unparseable
+RAID_HIGHLIGHT_MIN_SECONDS = 5 * 60  # 5 minutes
+RAID_HIGHLIGHT_MAX_SECONDS = 30 * 60  # 30 minutes
+RAID_HIGHLIGHT_FRACTION = 0.10  # 10% of the raid's total duration
+GUILD_TASK_HIGHLIGHT_SECONDS = 60 * 60  # 1 hour
+ORPHANAGE_HIGHLIGHT_SECONDS = 3 * 60 * 60  # 3 hours
+SANCTUARY_HIGHLIGHT_SECONDS = 3 * 60 * 60  # 3 hours
+VAULT_HIGHLIGHT_SECONDS = 60 * 60  # 1 hour
 
 # How often the background monitor polls the API. Also used below to size
 # WORLDBOSS_REMINDER_SECONDS_BEFORE with a safety margin (see its comment).
@@ -356,6 +494,28 @@ AUTH_FAILURE_THRESHOLD = 3
 #   re-notify every tick once a tier stays completed.
 last_sanctuary_active = _state.get("last_sanctuary_active")
 sanctuary_completed_tiers = _state.get("sanctuary_completed_tiers", [])
+
+# Vault code submissions made via /vault, awaiting or already given admin
+# review. Keyed by a short string ID (see _next_vault_submission_id) ->
+# {"code", "bonus_percent", "location", "submitter_id", "submitter_name",
+# "status" ("pending"/"approved"/"rejected"), "review_channel_id",
+# "review_message_id", "reviewed_by_id", "reviewed_by_name",
+# "created_at"}. Persisted so pending submissions (and their Approve/Reject
+# buttons — see VaultReviewView) survive a bot restart.
+vault_submissions = _state.get("vault_submissions", {})
+# Simple incrementing counter used to generate submission IDs. Kept
+# separate from len(vault_submissions) so IDs never get reused even after
+# old submissions are eventually cleaned up.
+vault_submission_counter = _state.get("vault_submission_counter", 0)
+
+# The currently published/approved vault code (a copy of its submission
+# dict, plus "approved_at"), or None if none has been approved yet today.
+# This is what the persistent VAULT_CHANNEL_ID status message reflects —
+# see create_vault_status_embed — so the channel always shows *something*
+# ("not found yet" when None) instead of staying empty until the first
+# approval. Cleared back to None by the daily reset (see
+# _run_vault_daily_reset), since a new day means a new code.
+current_vault = _state.get("current_vault")
 
 # Persistent "status" message tracking: one message per feature, edited in
 # place every tick instead of spamming a new message each time. Keyed by a
@@ -409,6 +569,7 @@ def persist_state():
             "last_worldboss": last_worldboss,
             "last_guild_task_key": last_guild_task_key,
             "guild_task_completed_notified": guild_task_completed_notified,
+            "status_highlights": status_highlights,
             "last_guild_task_current": last_guild_task_current,
             "raid_reminder_sent": raid_reminder_sent,
             "no_raid_logged": no_raid_logged,
@@ -420,8 +581,94 @@ def persist_state():
             "pending_notification_deletions": pending_notification_deletions,
             "worldboss_active_notification_ids": worldboss_active_notification_ids,
             "worldboss_carousel_boss_id": worldboss_carousel_boss_id,
+            "vault_submissions": vault_submissions,
+            "vault_submission_counter": vault_submission_counter,
+            "current_vault": current_vault,
         }
     )
+
+
+def _set_highlight(feature_key, kind, duration_seconds):
+    """Marks `feature_key`'s status message as highlighted with `kind` for
+    the next `duration_seconds` — see status_highlights above. Persists
+    immediately so the highlight window survives a restart."""
+    global status_highlights
+    status_highlights[feature_key] = {"kind": kind, "until": time.time() + duration_seconds}
+    persist_state()
+
+
+def _active_highlight(feature_key):
+    """Returns the currently active highlight kind for `feature_key`, or
+    None if there isn't one or it has already expired. An expired entry is
+    cleared here (once, on the first check after it lapses) so the status
+    message naturally reverts to its plain look without needing a separate
+    timer."""
+    global status_highlights
+    info = status_highlights.get(feature_key)
+    if not info:
+        return None
+    if time.time() >= info.get("until", 0):
+        del status_highlights[feature_key]
+        persist_state()
+        return None
+    return info.get("kind")
+
+
+def _role_ping_content(role_id):
+    """Builds the message content for a one-off role ping, or None if no
+    role is configured for that feature. Meant to be passed as `content`
+    on the single tick a highlight starts — see upsert_status_message's
+    `content` parameter — since Discord notifies mentioned roles/users
+    even when the mention is added via an edit, not just on a fresh
+    message. Requires the role to actually be mentionable and the bot to
+    have permission to mention roles in that channel."""
+    return f"<@&{role_id}>" if role_id else None
+
+
+def _next_vault_submission_id():
+    """Generates the next vault submission ID (a simple incrementing
+    string counter) and persists it immediately, so IDs stay unique and
+    monotonically increasing even across restarts."""
+    global vault_submission_counter
+    vault_submission_counter += 1
+    persist_state()
+    return str(vault_submission_counter)
+
+
+def _can_review_vault(member):
+    """True if `member` is allowed to Approve/Reject a pending vault
+    submission. If VAULT_REVIEWER_ROLE_ID is configured, only members with
+    that exact role qualify; otherwise anyone with the "Manage Server" or
+    Administrator permission does, so the feature is usable without
+    requiring a dedicated role to be set up first."""
+    if not isinstance(member, discord.Member):
+        # Can't check roles/permissions on a bare discord.User (e.g. if
+        # this interaction somehow didn't happen in a guild) — deny by
+        # default rather than risk letting anyone through.
+        return False
+
+    if VAULT_REVIEWER_ROLE_ID is not None:
+        return any(role.id == VAULT_REVIEWER_ROLE_ID for role in member.roles)
+
+    perms = member.guild_permissions
+    return perms.manage_guild or perms.administrator
+
+
+async def _safe_respond(interaction: discord.Interaction, content, ephemeral=True):
+    """Sends `content` to the user no matter what state this interaction's
+    response is already in — send_message if nothing has been sent yet,
+    followup.send otherwise (e.g. after an edit_message or an earlier
+    response) — so every error path in the vault flow ends with something
+    visible to the user instead of a silently failed interaction. Failures
+    here are only logged: if we can't tell the user, there's nothing more
+    to do about it."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+    except discord.HTTPException as e:
+        logger.warning(f"Failed to send a response to the user: {e}")
 
 
 # ==========================================================
@@ -439,7 +686,7 @@ def persist_state():
 #    (see send_notification's expire_at/expire_seconds).
 
 
-async def upsert_status_message(channels, channel_id, feature_key, embed, view=None):
+async def upsert_status_message(channels, channel_id, feature_key, embed, view=None, content=None):
     """Sends the persistent status embed for `feature_key` the first time,
     then edits that SAME message on every subsequent call. If the stored
     message was deleted out-of-band (manually, channel purge, etc.) or its
@@ -447,7 +694,14 @@ async def upsert_status_message(channels, channel_id, feature_key, embed, view=N
 
     `view` is optional (most status embeds don't need one); when given, it's
     attached/kept on both the initial send and every later edit — used by
-    the worldboss carousel to keep its ◀ 🔄 ▶ buttons on the message."""
+    the worldboss carousel to keep its ◀ 🔄 ▶ buttons on the message.
+
+    `content` is optional and meant to be transient: pass a role mention
+    (see _role_ping_content) on the single tick a highlight starts to ping
+    that role via Discord's "mention added on edit still notifies"
+    behavior, then leave it as None on every following call so it's
+    cleared again (edit(content=None) removes the message's content) —
+    the mention shouldn't sit there permanently."""
     channel = channels.get(channel_id)
     if channel is None:
         return
@@ -458,7 +712,7 @@ async def upsert_status_message(channels, channel_id, feature_key, embed, view=N
     if info and info.get("channel_id") == channel_id:
         try:
             message = await channel.fetch_message(info["message_id"])
-            await message.edit(embed=embed, view=view)
+            await message.edit(content=content, embed=embed, view=view)
             return
         except discord.NotFound:
             pass  # message is gone — fall through and recreate it below
@@ -467,7 +721,7 @@ async def upsert_status_message(channels, channel_id, feature_key, embed, view=N
             return
 
     try:
-        message = await channel.send(embed=embed, view=view)
+        message = await channel.send(content=content, embed=embed, view=view)
     except discord.HTTPException as e:
         logger.warning(f"Failed to send '{feature_key}' status message: {e}")
         return
@@ -525,7 +779,27 @@ MAX_REQUESTS_PER_MINUTE = 35
 # this, a stalled/hanging response could block the monitor tick indefinitely.
 HTTP_TIMEOUT_SECONDS = 15
 
+# How many EXTRA attempts to make after a transient network error (connection
+# drops, DNS hiccups, timeouts) before giving up on that call for this tick —
+# NOT for API-level failures like 401/429/405, which are real responses from
+# the server and retrying those blindly would just hammer a broken or
+# rate-limited endpoint harder rather than help. A single flaky network blip
+# would otherwise cost a full status update for that feature until the next
+# monitor tick a minute later.
+SMMO_REQUEST_MAX_RETRIES = 2
+SMMO_REQUEST_RETRY_DELAY_SECONDS = 2
+
 request_times = deque()
+
+# Guards the read-check-append sequence in rate_limit() below. Without it,
+# the monitor tick and a concurrently-running slash command could both read
+# request_times at the same instant, both see room under the limit, and
+# both proceed — pushing the actual request count slightly over
+# MAX_REQUESTS_PER_MINUTE. Holding this lock for the full duration of
+# rate_limit() (including any sleep while waiting out the window) is
+# intentional: it serializes ALL callers, which is what actually keeps the
+# combined request rate under the limit rather than just each caller's own.
+_rate_limit_lock = asyncio.Lock()
 
 
 def _prune_request_times():
@@ -537,15 +811,16 @@ def _prune_request_times():
 
 
 async def rate_limit():
-    _prune_request_times()
-
-    if len(request_times) >= MAX_REQUESTS_PER_MINUTE:
-        wait_time = 60 - (time.time() - request_times[0])
-        logger.warning(f"Rate limit reached. Waiting {wait_time:.2f}s")
-        await asyncio.sleep(wait_time)
+    async with _rate_limit_lock:
         _prune_request_times()
 
-    request_times.append(time.time())
+        if len(request_times) >= MAX_REQUESTS_PER_MINUTE:
+            wait_time = 60 - (time.time() - request_times[0])
+            logger.warning(f"Rate limit reached. Waiting {wait_time:.2f}s")
+            await asyncio.sleep(wait_time)
+            _prune_request_times()
+
+        request_times.append(time.time())
 
 
 # ==========================================================
@@ -591,28 +866,44 @@ def _mask_secret(text):
 
 
 async def smmo_request(endpoint, method="POST"):
-    """Make a request to the SimpleMMO API using api_key as a query parameter."""
-
-    await rate_limit()
+    """Make a request to the SimpleMMO API using api_key as a query parameter.
+    Retries up to SMMO_REQUEST_MAX_RETRIES times on transient network errors
+    only (see its comment above) — a real API response (even an error one
+    like 401/429) is handled by _handle_response and never retried here."""
 
     separator = "&" if "?" in endpoint else "?"
     url = f"https://api.simple-mmo.com{endpoint}{separator}api_key={API_KEY}"
 
-    session = await get_session()
+    for attempt in range(SMMO_REQUEST_MAX_RETRIES + 1):
+        await rate_limit()
 
-    try:
-        if method == "POST":
-            async with session.post(url) as response:
-                return await _handle_response(response, endpoint)
-        else:
-            async with session.get(url) as response:
-                return await _handle_response(response, endpoint)
-    except aiohttp.ClientError as e:
-        logger.error(f"Network error on {endpoint}: {_mask_secret(e)}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error on {endpoint}: {_mask_secret(e)}")
-        return None
+        session = await get_session()
+
+        try:
+            if method == "POST":
+                async with session.post(url) as response:
+                    return await _handle_response(response, endpoint)
+            else:
+                async with session.get(url) as response:
+                    return await _handle_response(response, endpoint)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if attempt < SMMO_REQUEST_MAX_RETRIES:
+                logger.warning(
+                    f"Network error on {endpoint} (attempt {attempt + 1}/"
+                    f"{SMMO_REQUEST_MAX_RETRIES + 1}), retrying in "
+                    f"{SMMO_REQUEST_RETRY_DELAY_SECONDS}s: {_mask_secret(e)}"
+                )
+                await asyncio.sleep(SMMO_REQUEST_RETRY_DELAY_SECONDS)
+                continue
+            logger.error(
+                f"Network error on {endpoint}, giving up after {attempt + 1} attempt(s): {_mask_secret(e)}"
+            )
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error on {endpoint}: {_mask_secret(e)}")
+            return None
+
+    return None  # unreachable — the loop above always returns or retries
 
 
 async def _handle_response(response, endpoint):
@@ -804,7 +1095,14 @@ async def check_worldboss():
     - activated: bosses whose state changed from inactive to active since
       the last check — the caller sends a "World Boss Active!" notification
       for each of these, in addition to the earlier "incoming" heads-up.
-    - killed: bosses whose state changed from active to dead (hp <= 0) since the last check
+    - killed: bosses whose state changed from active to dead since the last
+      check. This includes both bosses still present in the API response
+      with current_hp <= 0, AND bosses that were active last tick but have
+      now disappeared entirely from the API response (see FIX below) —
+      some SimpleMMO endpoints stop listing a boss once it's dead instead
+      of keeping it in the list with 0 HP, so relying only on "still
+      present with hp <= 0" silently misses those and leaves their "Active"
+      notification stuck in the channel forever.
     - incoming: the next upcoming boss if it's about to spawn within
       WORLDBOSS_REMINDER_SECONDS_BEFORE seconds and hasn't been notified yet
       for this specific enable_time, otherwise None
@@ -826,11 +1124,13 @@ async def check_worldboss():
     new_state = {}
     activated = []
     killed = []
+    seen_ids = set()
 
     for boss in bosses:
         boss_id = str(boss.get("id"))
         if boss_id == "None":
             continue
+        seen_ids.add(boss_id)
 
         active_now = is_boss_active(boss, now)
         current_hp = boss.get("current_hp") or 0
@@ -843,7 +1143,37 @@ async def check_worldboss():
         elif was_active and current_hp <= 0:
             killed.append(boss)
 
-        new_state[boss_id] = {"active": active_now, "hp": current_hp}
+        # Keep name/avatar alongside active/hp so a boss that later
+        # disappears from the API entirely (see FIX below) can still be
+        # rendered in the "defeated" embed instead of showing "Unknown".
+        new_state[boss_id] = {
+            "active": active_now,
+            "hp": current_hp,
+            "name": boss.get("name"),
+            "avatar": boss.get("avatar"),
+        }
+
+    # FIX: some SimpleMMO responses simply stop listing a boss once it's
+    # dead, instead of keeping it in the list with current_hp <= 0. Without
+    # this, a boss that was active last tick and then vanishes from the
+    # response entirely is never detected as "killed" — `elif was_active
+    # and current_hp <= 0` above never runs for it, because it's no longer
+    # in `bosses` to iterate over at all. That left its "🔥 World Boss
+    # Active!" notification stuck in the channel until its 24h safety-net
+    # expiry, even though the boss was already dead. Treat "was active last
+    # tick, missing from the response now" as a kill too.
+    for boss_id, prev in last_worldboss.items():
+        if prev.get("active") and boss_id not in seen_ids:
+            killed.append(
+                {
+                    "id": boss_id,
+                    "name": prev.get("name", "Unknown"),
+                    "avatar": prev.get("avatar"),
+                    "current_hp": 0,
+                }
+            )
+            # Also drop it from new_state so it doesn't keep being reported
+            # as "was active" forever once it's gone from the API for good.
 
     if new_state != last_worldboss:
         last_worldboss = new_state
@@ -1042,6 +1372,9 @@ COLOR_SANCTUARY = 0x9B59B6
 COLOR_SANCTUARY_COMPLETE = 0xF1C40F
 COLOR_ERROR = 0xC0392B
 COLOR_NEUTRAL = 0x99AAB5  # used for "nothing active right now" states
+COLOR_VAULT = 0x1ABC9C
+COLOR_VAULT_PENDING = 0xF39C12
+COLOR_VAULT_REJECTED = 0x7F8C8D
 
 DIVIDER = "▬" * 24
 
@@ -1053,6 +1386,23 @@ DIVIDER = "▬" * 24
 # to Discord itself, or the official icon if you source it from the site).
 # If unset, the embed simply has no thumbnail.
 ORPHANAGE_THUMBNAIL_URL = os.getenv("ORPHANAGE_THUMBNAIL_URL") or None
+
+# Optional thumbnail for the published vault code embed, same rationale as
+# ORPHANAGE_THUMBNAIL_URL above: no guessed default, set it explicitly in
+# .env if you want one.
+VAULT_THUMBNAIL_URL = os.getenv("VAULT_THUMBNAIL_URL") or None
+
+# Fixed display order + icon for each vault bonus category. The bonus
+# percentage submitted via /vault applies uniformly to all five (matching
+# how these codes actually work — one percentage, shown once per
+# category), so this only needs to supply the label/icon, not a value.
+VAULT_BONUS_CATEGORIES = [
+    ("BA Exp", "🥋"),
+    ("PvP Exp", "⚔️"),
+    ("Step Exp", "👣"),
+    ("Quest Exp", "📜"),
+    ("Profession Exp", "⚒️"),
+]
 
 # The SimpleMMO API returns each world boss's avatar as a RELATIVE path
 # (e.g. "bosses/19"), not a full URL, so it must be combined with a base
@@ -1131,12 +1481,19 @@ def format_number(n):
 
 
 def format_unix_relative(unix_ts):
-    """Formats a raw Unix timestamp (int/float) as a Discord relative
-    timestamp, e.g. 'in 3 hours'. Used for world boss enable_time, which is
-    already a Unix timestamp (unlike the ISO strings used elsewhere)."""
+    """Formats a raw Unix timestamp (int/float) as a Discord timestamp that
+    combines the exact date/time (style 'f') with the relative countdown
+    (style 'R') — e.g. 'June 18, 2026 3:53 PM (in 3 hours)' — same pattern
+    as parse_timestamp above. Used for world boss enable_time and the vault
+    reset timestamp, both of which are already Unix timestamps (unlike the
+    ISO strings parse_timestamp handles). Showing the absolute date/time
+    alongside the countdown means the day is still readable later on too —
+    e.g. if the bot is stopped and nothing gets refreshed anymore, you can
+    still tell which day the message was originally about."""
     if not unix_ts:
         return "Unknown"
-    return f"<t:{int(unix_ts)}:R>"
+    unix_ts = int(unix_ts)
+    return f"<t:{unix_ts}:f> (<t:{unix_ts}:R>)"
 
 
 def _format_duration(seconds):
@@ -1239,7 +1596,7 @@ def create_orphanage_embed(orphanage):
     return _finalize_embed(embed, "📣 Orphanage update")
 
 
-def create_orphanage_status_embed(tiers):
+def create_orphanage_status_embed(tiers, highlight_kind=None):
     """Always-current status of ALL orphanage tiers, for the persistent
     status message. Design goals:
     - the active tier is called out right in the description;
@@ -1247,9 +1604,14 @@ def create_orphanage_status_embed(tiers):
     - the active tier is always shown first, then the rest in the API's
       original order — so the most relevant info is always the first
       thing you see, no scrolling needed.
+
+    `highlight_kind="new_tier"` briefly swaps the title to announce a tier
+    just became active — see ORPHANAGE_HIGHLIGHT_SECONDS — instead of a
+    separate notification message.
     """
+    title = "🏠✨ New Orphanage Tier Active!" if highlight_kind == "new_tier" else "🏠 Orphanage Status"
     embed = discord.Embed(
-        title="🏠 Orphanage Status",
+        title=title,
         color=COLOR_ORPHANAGE,
     )
 
@@ -1319,6 +1681,25 @@ def _raid_duration_only(raid):
     if started_ts is None or expires_ts is None:
         return None
     return _format_duration(expires_ts - started_ts)
+
+
+def _raid_highlight_duration(raid):
+    """How long THIS raid's status message should stay highlighted after it
+    starts: RAID_HIGHLIGHT_FRACTION of its own total duration (started_at to
+    expires_at), clamped to [RAID_HIGHLIGHT_MIN_SECONDS,
+    RAID_HIGHLIGHT_MAX_SECONDS] — a short raid doesn't get an
+    unreasonably-short highlight, and a long one doesn't stay highlighted
+    for way longer than it needs to just because it happens to run for many
+    hours. Falls back to RAID_HIGHLIGHT_FALLBACK_SECONDS if the timestamps
+    are missing or unparseable, so a raid with incomplete data still gets a
+    sensible highlight window instead of none at all."""
+    started_ts = _iso_to_unix(raid.get("started_at"))
+    expires_ts = _iso_to_unix(raid.get("expires_at"))
+    if started_ts is None or expires_ts is None or expires_ts <= started_ts:
+        return RAID_HIGHLIGHT_FALLBACK_SECONDS
+
+    total = expires_ts - started_ts
+    return max(RAID_HIGHLIGHT_MIN_SECONDS, min(RAID_HIGHLIGHT_MAX_SECONDS, total * RAID_HIGHLIGHT_FRACTION))
 
 
 def _raid_location_line(locations):
@@ -1406,10 +1787,12 @@ def create_raid_reminder_embed(raid):
     return _finalize_embed(embed, "📣 Raid reminder")
 
 
-def create_raid_status_embed(raid):
+def create_raid_status_embed(raid, highlighted=False):
     """Always-current raid status, for the persistent status message (as
-    opposed to create_raid_embed/create_raid_reminder_embed, which are for
-    one-off event notifications)."""
+    opposed to create_raid_reminder_embed, which is for the separate
+    "expiring soon" reminder). `highlighted=True` briefly swaps the title
+    to a "New Raid Started!" banner right after a raid begins — see
+    _raid_highlight_duration — instead of a separate notification message."""
     if raid is None or not is_valid_raid(raid):
         embed = discord.Embed(
             title="⚔️ Raid Status",
@@ -1419,9 +1802,10 @@ def create_raid_status_embed(raid):
         return _finalize_embed(embed, "🔄 Live status — updates automatically")
 
     location_line, is_multi = _raid_location_line(raid.get("locations", []))
+    title = "🆕 New Raid Started!" if highlighted else "⚔️ Raid Status"
 
     embed = discord.Embed(
-        title="⚔️ Raid Status",
+        title=title,
         description=f"### 🟢 Active — 📍 {location_line}"
         if not is_multi
         else "### 🟢 A raid is currently active!",
@@ -1565,8 +1949,6 @@ def create_worldboss_card_embed(boss, now=None):
         embed.add_field(
             name="Activate in", value=f"**{format_unix_relative(enable_time)}**", inline=True
         )
-        if enable_time:
-            embed.add_field(name="Activate on", value=f"<t:{int(enable_time)}:f>", inline=True)
 
     if avatar_url:
         embed.set_thumbnail(url=avatar_url)
@@ -1666,51 +2048,26 @@ class WorldBossCarouselView(discord.ui.View):
         await interaction.response.edit_message(embed=create_worldboss_card_embed(boss, now), view=self)
 
 
-def create_guild_task_embed(task, completed=False):
-    task_type = str(task.get("type", "Unknown")).capitalize()
-    exp_reward = task.get("exp_reward", 0)
-    pp_reward = task.get("power_point_reward", 0)
-    target = task.get("target_amount", 0)
 
-    if completed:
-        embed = discord.Embed(
-            title="✅ Guild Task Completed!",
-            description=f"The **{task_type}** task is done — nice work, guild!",
-            color=COLOR_GUILD_TASK_COMPLETE,
-        )
-        embed.add_field(
-            name="🎯 Final Tally", value=f"{target:,} / {target:,} (**100%**)", inline=False
-        )
-    else:
-        embed = discord.Embed(
-            title="📋 New Guild Task!",
-            description=f"Type: **{task_type}**",
-            color=COLOR_GUILD_TASK,
-        )
-        current = task.get("current_amount", 0)
-        bar, pct = _progress_bar(current, target, fill="🟦")
-        embed.add_field(
-            name="📊 Progress",
-            value=f"{bar} **{pct}%**\n{current:,} / {target:,}",
-            inline=False,
-        )
-
-    embed.add_field(
-        name="🎁 Reward",
-        value=f"{format_number(exp_reward)} EXP  •  {format_number(pp_reward)} Power Points",
-        inline=False,
-    )
-
-    return _finalize_embed(embed, "📣 Guild task update")
-
-
-def create_guild_task_status_embed(task):
+def create_guild_task_status_embed(task, highlight_kind=None):
+    """`highlight_kind` ("new", "completed", or None) temporarily swaps the
+    title/color to announce what just happened — see
+    GUILD_TASK_HIGHLIGHT_SECONDS — instead of a separate notification
+    message. Falls back to the plain status look once the highlight window
+    passes (or if nothing just happened)."""
     task_type = str(task.get("type", "Unknown")).capitalize()
     current = task.get("current_amount", 0)
     target = task.get("target_amount", 0)
     bar, pct = _progress_bar(current, target, fill="🟦")
 
-    embed = discord.Embed(title="📋 Guild Task Status", color=COLOR_GUILD_TASK)
+    if highlight_kind == "new":
+        title, color = "🆕 New Guild Task!", COLOR_GUILD_TASK
+    elif highlight_kind == "completed":
+        title, color = "✅ Guild Task Completed!", COLOR_GUILD_TASK_COMPLETE
+    else:
+        title, color = "📋 Guild Task Status", COLOR_GUILD_TASK
+
+    embed = discord.Embed(title=title, color=color)
     embed.add_field(name="Type", value=f"**{task_type}**", inline=True)
     embed.add_field(name="Progress", value=f"**{pct}%**", inline=True)
     embed.add_field(
@@ -1726,7 +2083,7 @@ def create_guild_task_status_embed(task):
     return _finalize_embed(embed, "🔄 Live status — updates automatically")
 
 
-def create_guild_task_status_embed_safe(task):
+def create_guild_task_status_embed_safe(task, highlight_kind=None):
     """Same as create_guild_task_status_embed, but also handles the "no
     active task right now" case — used by the persistent status message,
     which (unlike the /task command) must always produce *something* to
@@ -1739,55 +2096,21 @@ def create_guild_task_status_embed_safe(task):
         )
         return _finalize_embed(embed, "🔄 Live status — updates automatically")
 
-    return create_guild_task_status_embed(task)
+    return create_guild_task_status_embed(task, highlight_kind=highlight_kind)
 
 
-def create_sanctuary_active_embed(tier):
-    tier_name = tier.get("tier", {}).get("name", "Unknown Tier")
+def create_sanctuary_status_embed(tiers, highlight_kind=None):
+    """`highlight_kind` ("active", "completed", or None) briefly swaps the
+    title to announce what just happened — see SANCTUARY_HIGHLIGHT_SECONDS
+    — instead of a separate notification message."""
+    if highlight_kind == "active":
+        title, color = "🏛️ Sanctuary Tier Active!", COLOR_SANCTUARY
+    elif highlight_kind == "completed":
+        title, color = "🏆 Sanctuary Tier Completed!", COLOR_SANCTUARY_COMPLETE
+    else:
+        title, color = "🏛️ Guild Sanctuary Status", COLOR_SANCTUARY
 
-    embed = discord.Embed(
-        title="🏛️ Sanctuary Tier Active!",
-        description=f"**{tier_name}** is now the active guild sanctuary tier!",
-        color=COLOR_SANCTUARY,
-    )
-
-    embed.add_field(
-        name="✨ Active Bonuses",
-        value=_safe_field_value(_bullet_list(tier.get("effects", []))),
-        inline=False,
-    )
-
-    return _finalize_embed(embed, "📣 Sanctuary update")
-
-
-def create_sanctuary_completed_embed(tier):
-    tier_name = tier.get("tier", {}).get("name", "Unknown Tier")
-    current = tier.get("current_value", 0)
-    target = tier.get("target_value", 0)
-
-    embed = discord.Embed(
-        title="🏆 Sanctuary Tier Completed!",
-        description=f"**{tier_name}** has reached its goal — well done, guild!",
-        color=COLOR_SANCTUARY_COMPLETE,
-    )
-
-    embed.add_field(
-        name="🎯 Final Tally",
-        value=f"{format_number(current)} / {format_number(target)} (**100%**)",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="✨ Effects Unlocked",
-        value=_safe_field_value(_bullet_list(tier.get("effects", []))),
-        inline=False,
-    )
-
-    return _finalize_embed(embed, "📣 Sanctuary update")
-
-
-def create_sanctuary_status_embed(tiers):
-    embed = discord.Embed(title="🏛️ Guild Sanctuary Status", color=COLOR_SANCTUARY)
+    embed = discord.Embed(title=title, color=color)
 
     for tier in tiers:
         tier_name = tier.get("tier", {}).get("name", "Unknown Tier")
@@ -1835,6 +2158,480 @@ def create_auth_failure_embed(count, endpoint):
     return _finalize_embed(embed, "🚨 Action required")
 
 
+def _vault_note_line(submission, reviewer_mention=None):
+    """Builds the 'Code posted by X [at Y][, verified by Z]' note line
+    shared by both the review card and the final published embed."""
+    line = f"Code posted by {submission['submitter_name']}"
+    if submission.get("location"):
+        line += f" at {submission['location']}"
+    if reviewer_mention:
+        line += f", verified by {reviewer_mention}"
+    return line
+
+
+def create_vault_review_embed(submission, status_note=None):
+    """Card shown in the review channel for a /vault submission. Includes
+    Approve/Reject buttons (see VaultReviewView) while status is "pending";
+    once reviewed (or expired by the daily reset — see
+    _run_vault_daily_reset), the caller re-renders this with `status_note`
+    set to a short outcome line and removes the buttons."""
+    status = submission.get("status", "pending")
+
+    if status == "approved":
+        title, color = "✅ Vault Code Approved", COLOR_VAULT
+    elif status == "rejected":
+        title, color = "❌ Vault Code Rejected", COLOR_VAULT_REJECTED
+    elif status == "expired":
+        title, color = "⌛ Vault Code Expired", COLOR_VAULT_REJECTED
+    elif status == "superseded":
+        title, color = "🔁 Vault Code Superseded", COLOR_VAULT_REJECTED
+    elif status == "cancelled":
+        title, color = "🚫 Vault Code Withdrawn", COLOR_VAULT_REJECTED
+    else:
+        title, color = "🔍 Vault Code Pending Review", COLOR_VAULT_PENDING
+
+    embed = discord.Embed(title=title, color=color)
+    embed.add_field(name="Daily Code", value=f"`{submission['code']}`", inline=True)
+    embed.add_field(name="Vault Bonus", value=f"**{submission['bonus_percent']}%** (all categories)", inline=True)
+    if submission.get("location"):
+        embed.add_field(name="Location", value=submission["location"], inline=True)
+    embed.add_field(name="Submitted by", value=f"<@{submission['submitter_id']}>", inline=False)
+
+    if status_note:
+        embed.add_field(name="Status", value=status_note, inline=False)
+    elif status == "pending":
+        embed.add_field(name="Status", value="⏳ Waiting for an admin to Approve or Reject.", inline=False)
+
+    return _finalize_embed(embed, "🗝️ Vault code review")
+
+
+def create_vault_status_embed(current, highlight_kind=None):
+    """Always-current status of today's vault code, for the persistent
+    VAULT_CHANNEL_ID status message — same pattern as raid/orphanage/task/
+    sanctuary: one message, edited in place every tick (see _monitor_tick),
+    so the channel always shows *something* instead of staying empty until
+    the first code is approved.
+
+    `current` is the currently approved vault dict (see `current_vault`),
+    or None if nothing has been approved yet today (e.g. right after
+    startup, or right after the daily reset — see _run_vault_daily_reset).
+
+    `highlight_kind="published"` briefly swaps the title to announce a
+    fresh code just got approved — see VAULT_HIGHLIGHT_SECONDS — instead
+    of a separate notification message.
+    """
+    if not current:
+        embed = discord.Embed(
+            title="🗝️ Vault Code Status",
+            description="### 😴 No vault code found for today yet.",
+            color=COLOR_NEUTRAL,
+        )
+
+        if VAULT_THUMBNAIL_URL:
+            embed.set_thumbnail(url=VAULT_THUMBNAIL_URL)
+
+        embed.add_field(
+            name="📮 Found one?",
+            value="Use **`/vault`** to send it in — an admin will verify it before it's posted here.",
+            inline=False,
+        )
+
+        return _finalize_embed(embed, "🔄 Live status — resets daily")
+
+    title = "🆕 New Vault Code Published!" if highlight_kind == "published" else "🗝️ Vault Code Status"
+
+    embed = discord.Embed(
+        title=title,
+        description=(
+            "🌟 Using this vault code provides daily boosts for your "
+            "experience gains across various categories."
+        ),
+        color=COLOR_VAULT,
+    )
+
+    if VAULT_THUMBNAIL_URL:
+        embed.set_thumbnail(url=VAULT_THUMBNAIL_URL)
+
+    embed.add_field(name="🔑 Daily Code", value=f"## {current['code']}", inline=False)
+
+    _add_divider(embed)
+
+    bonus_lines = [
+        f"{icon}  **{label}**  `{current['bonus_percent']}%`" for label, icon in VAULT_BONUS_CATEGORIES
+    ]
+    embed.add_field(name="✨ Vault Bonus", value=_safe_field_value("\n".join(bonus_lines)), inline=False)
+
+    reviewer_mention = (
+        f"<@{current['reviewed_by_id']}>"
+        if current.get("reviewed_by_id")
+        else current.get("reviewed_by_name", "an admin")
+    )
+    embed.add_field(
+        name="📝 Note",
+        value=_safe_field_value(_vault_note_line(current, reviewer_mention)),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🔒 Got a different code?",
+        value=(
+            f"Today's code is already locked in — the next one can be "
+            f"submitted {format_unix_relative(_next_vault_reset_timestamp())}."
+        ),
+        inline=False,
+    )
+
+    return _finalize_embed(embed, "🔄 Live status — resets daily")
+
+
+class VaultReviewView(discord.ui.View):
+    """Persistent Approve/Reject controls for a single pending /vault
+    submission. Each instance is bound to one submission_id via its
+    buttons' custom_id (vault_approve:<id> / vault_reject:<id>), which is
+    how discord.py matches interactions back to a live handler after a
+    restart — see on_ready, which re-creates and re-registers one of these
+    per still-pending submission on startup. `timeout=None` is required
+    for the buttons to keep working indefinitely, not just for the
+    lifetime of the process that first sent the message."""
+
+    def __init__(self, submission_id):
+        super().__init__(timeout=None)
+        self.submission_id = submission_id
+
+        approve = discord.ui.Button(
+            label="✅ Approve",
+            style=discord.ButtonStyle.success,
+            custom_id=f"vault_approve:{submission_id}",
+        )
+        approve.callback = self._approve
+        self.add_item(approve)
+
+        reject = discord.ui.Button(
+            label="❌ Reject",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"vault_reject:{submission_id}",
+        )
+        reject.callback = self._reject
+        self.add_item(reject)
+
+    async def _approve(self, interaction: discord.Interaction):
+        await _handle_vault_review(interaction, self.submission_id, approved=True)
+
+    async def _reject(self, interaction: discord.Interaction):
+        await _handle_vault_review(interaction, self.submission_id, approved=False)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        # Safety net for anything NOT already caught inside
+        # _handle_vault_review — e.g. a bug in a future edit of this
+        # class. Without this override, discord.py just logs the error to
+        # stderr and the reviewer sees no response at all. Mirrors
+        # on_app_command_error's role for slash commands.
+        logger.exception(
+            f"Unhandled error in vault review button (submission {self.submission_id})", exc_info=error
+        )
+        await _safe_respond(interaction, "⚠️ Something went wrong while processing that. It's been logged.")
+
+
+async def _supersede_other_pending_vault_submissions(approved_submission_id):
+    """Once a submission is approved for today, any OTHER submission still
+    sitting in 'pending' is now moot — today's code is already locked in
+    (the /vault command itself refuses new submissions once current_vault
+    is set, but submissions made just before the approval can still be
+    pending at this exact moment). Without this, those review cards would
+    stay stuck showing 'Waiting for an admin to Approve or Reject' until
+    the next daily reset expires them, even though reviewing them at that
+    point would be pointless. Marks each as 'superseded' and updates its
+    review card in place (best-effort — a card that can't be edited is
+    only logged, not retried, since the state change itself is what
+    matters)."""
+    global vault_submissions
+
+    others = [
+        (sid, sub)
+        for sid, sub in vault_submissions.items()
+        if sid != approved_submission_id and sub.get("status") == "pending"
+    ]
+    if not others:
+        return
+
+    for submission_id, submission in others:
+        submission["status"] = "superseded"
+
+        review_channel_id = submission.get("review_channel_id")
+        review_message_id = submission.get("review_message_id")
+        if not (review_channel_id and review_message_id):
+            continue
+
+        review_channel = await _resolve_text_channel(review_channel_id)
+        if review_channel is None:
+            continue
+
+        try:
+            review_message = await review_channel.fetch_message(review_message_id)
+            await review_message.edit(
+                embed=create_vault_review_embed(
+                    submission,
+                    status_note="🔁 Superseded — another submission was approved for today first.",
+                ),
+                view=None,
+            )
+        except discord.NotFound:
+            pass  # review card already gone — nothing to update
+        except discord.HTTPException as e:
+            logger.warning(f"Failed to mark vault submission {submission_id} as superseded: {e}")
+
+    logger.info(f"Superseded {len(others)} other pending vault submission(s) after an approval")
+    persist_state()
+
+
+async def _handle_vault_review(interaction: discord.Interaction, submission_id, approved):
+    """Shared Approve/Reject handler for VaultReviewView. Re-checks the
+    submission's current status and the reviewer's permission on every
+    click (not just at message-send time), since either could have changed
+    since the button was posted — e.g. someone else already reviewed it,
+    the daily reset expired it, or the reviewer's role was removed in the
+    meantime. Every exit path calls _safe_respond so the reviewer always
+    sees *something*, never a silently failed click."""
+    global vault_submissions, current_vault
+
+    submission = vault_submissions.get(submission_id)
+    if submission is None:
+        await _safe_respond(interaction, "⚠️ This vault submission no longer exists.")
+        return
+
+    if not _can_review_vault(interaction.user):
+        await _safe_respond(interaction, "🚫 You don't have permission to review vault submissions.")
+        return
+
+    if submission.get("status") != "pending":
+        await _safe_respond(interaction, f"ℹ️ This submission was already {submission.get('status')}.")
+        return
+
+    submission["status"] = "approved" if approved else "rejected"
+    submission["reviewed_by_id"] = interaction.user.id
+    submission["reviewed_by_name"] = interaction.user.display_name
+    persist_state()
+
+    reviewer_mention = interaction.user.mention
+    status_note = (
+        f"✅ Approved by {reviewer_mention}" if approved else f"❌ Rejected by {reviewer_mention}"
+    )
+
+    # Update the review card in place: same message, no buttons anymore
+    # (an empty view removes them), status line swapped to show the
+    # outcome and who reviewed it. If this specific edit fails (message
+    # deleted out-of-band, permissions changed, etc.), the approval itself
+    # is already saved above and must still go through below — only the
+    # review card's own visual update is at risk here.
+    try:
+        await interaction.response.edit_message(
+            embed=create_vault_review_embed(submission, status_note=status_note),
+            view=None,
+        )
+    except discord.HTTPException as e:
+        logger.warning(f"Failed to update vault review card for submission {submission_id}: {e}")
+
+    if not approved:
+        # Best-effort DM to let the submitter know without leaving them
+        # guessing — failure here (DMs closed, etc.) is only logged, since
+        # there's no good way to surface it back to anyone.
+        try:
+            submitter = await bot.fetch_user(submission["submitter_id"])
+            await submitter.send(
+                f"❌ Your vault code submission (`{submission['code']}`) was not approved."
+            )
+        except discord.HTTPException as e:
+            logger.info(f"Could not DM submitter about rejected vault code: {e}")
+
+        await _safe_respond(interaction, status_note)
+        logger.info(f"Vault submission {submission_id} rejected by {interaction.user}")
+        return
+
+    # Approved: this becomes the new current vault code, shown on the
+    # persistent VAULT_CHANNEL_ID status message (highlighted briefly).
+    current_vault = dict(submission)
+    current_vault["approved_at"] = time.time()
+    persist_state()
+    _set_highlight("vault", "published", VAULT_HIGHLIGHT_SECONDS)
+
+    await _supersede_other_pending_vault_submissions(submission_id)
+
+    channel = await _resolve_text_channel(VAULT_CHANNEL_ID)
+    if channel is None:
+        logger.warning("Could not resolve VAULT_CHANNEL_ID to publish approved vault code")
+        await _safe_respond(
+            interaction,
+            f"{status_note}\n⚠️ But I couldn't reach the vault channel to publish it — "
+            "check VAULT_CHANNEL_ID and my permissions there.",
+        )
+        return
+
+    await upsert_status_message(
+        {VAULT_CHANNEL_ID: channel},
+        VAULT_CHANNEL_ID,
+        "vault",
+        create_vault_status_embed(current_vault, highlight_kind="published"),
+        content=_role_ping_content(VAULT_ROLE_ID),
+    )
+
+    await _safe_respond(interaction, status_note)
+    logger.info(f"Vault submission {submission_id} approved by {interaction.user}")
+
+
+# ==========================================================
+# VAULT DAILY RESET
+# ==========================================================
+
+
+def _parse_vault_reset_time():
+    """Parses VAULT_RESET_TIME/VAULT_RESET_TIMEZONE into a timezone-aware
+    datetime.time for the vault_daily_reset loop below. Evaluated once at
+    import time (tasks.loop needs an actual time object at decoration
+    time), so a change to either .env value requires a restart to take
+    effect — same as every other startup-time config in this file. Falls
+    back to 13:53 Europe/Rome on any parsing error, so a typo doesn't
+    prevent the bot from starting at all."""
+    fallback = dt_time(hour=13, minute=53, tzinfo=ZoneInfo("Europe/Rome"))
+    try:
+        hour_str, minute_str = VAULT_RESET_TIME.split(":")
+        tz = ZoneInfo(VAULT_RESET_TIMEZONE)
+        return dt_time(hour=int(hour_str), minute=int(minute_str), tzinfo=tz)
+    except (ValueError, ZoneInfoNotFoundError) as e:
+        logger.error(
+            f"Invalid VAULT_RESET_TIME ({VAULT_RESET_TIME!r}) or VAULT_RESET_TIMEZONE "
+            f"({VAULT_RESET_TIMEZONE!r}): {e}. Falling back to 13:53 Europe/Rome."
+        )
+        return fallback
+
+
+# Parsed once and reused everywhere (the task loop below, and
+# _next_vault_reset_timestamp), instead of re-parsing — and potentially
+# re-logging the same fallback warning — on every call. ZoneInfo makes
+# this correct year-round: it tracks Europe/Rome's CET/CEST switch
+# automatically, so 13:53 stays 13:53 local time through DST changes
+# without ever needing a manual offset adjustment.
+VAULT_RESET_TIME_OBJ = _parse_vault_reset_time()
+
+
+def _next_vault_reset_timestamp(now=None):
+    """Unix timestamp of the next occurrence of the configured daily vault
+    reset — today's if it hasn't happened yet, otherwise tomorrow's. Used
+    to tell users when submissions reopen after today's code has already
+    been published."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    local_now = now.astimezone(VAULT_RESET_TIME_OBJ.tzinfo)
+    candidate = local_now.replace(
+        hour=VAULT_RESET_TIME_OBJ.hour, minute=VAULT_RESET_TIME_OBJ.minute, second=0, microsecond=0
+    )
+    if candidate <= local_now:
+        candidate += timedelta(days=1)
+
+    return candidate.timestamp()
+
+
+@tasks.loop(time=VAULT_RESET_TIME_OBJ)
+async def vault_daily_reset():
+    try:
+        await _run_vault_daily_reset()
+    except Exception:
+        # Same philosophy as monitor(): never let this loop die silently —
+        # log the full traceback and let it run again at the next
+        # scheduled time instead.
+        logger.exception("Unexpected error during vault daily reset")
+
+
+def _cleanup_old_vault_submissions():
+    """Drops resolved vault submissions (approved/rejected/expired/
+    superseded) older than VAULT_SUBMISSION_RETENTION_SECONDS from
+    vault_submissions, so bot_state.json doesn't accumulate every code
+    ever posted forever. Anything still 'pending' is kept regardless of
+    age — that shouldn't normally happen (the daily reset expires stale
+    pending ones before this runs), but if it somehow did, silently
+    deleting a submission still awaiting review would be worse than
+    leaving it. Returns the number of submissions removed."""
+    global vault_submissions
+
+    cutoff = time.time() - VAULT_SUBMISSION_RETENTION_SECONDS
+    before_count = len(vault_submissions)
+
+    vault_submissions = {
+        sid: sub
+        for sid, sub in vault_submissions.items()
+        if sub.get("status") == "pending" or sub.get("created_at", 0) >= cutoff
+    }
+
+    removed = before_count - len(vault_submissions)
+    if removed:
+        logger.info(
+            f"Cleaned up {removed} resolved vault submission(s) older than "
+            f"{VAULT_SUBMISSION_RETENTION_DAYS} day(s)"
+        )
+    return removed
+
+
+async def _run_vault_daily_reset():
+    """Runs once a day at VAULT_RESET_TIME (VAULT_RESET_TIMEZONE) to mirror
+    the in-game vault code resetting: clears the current code and reverts
+    the status message back to 'not found yet', and expires any
+    submission still stuck in 'pending' from before the reset (approving
+    it afterwards would just republish a code for a day that's already
+    over)."""
+    global current_vault, vault_submissions
+
+    logger.info("Running daily vault reset")
+
+    current_vault = None
+    persist_state()
+
+    channel = await _resolve_text_channel(VAULT_CHANNEL_ID)
+    if channel is not None:
+        await upsert_status_message(
+            {VAULT_CHANNEL_ID: channel}, VAULT_CHANNEL_ID, "vault", create_vault_status_embed(None)
+        )
+    else:
+        logger.warning("Could not resolve VAULT_CHANNEL_ID during vault daily reset")
+
+    expired_count = 0
+    for submission_id, submission in vault_submissions.items():
+        if submission.get("status") != "pending":
+            continue
+
+        submission["status"] = "expired"
+        expired_count += 1
+
+        review_channel_id = submission.get("review_channel_id")
+        review_message_id = submission.get("review_message_id")
+        if not (review_channel_id and review_message_id):
+            continue
+
+        review_channel = await _resolve_text_channel(review_channel_id)
+        if review_channel is None:
+            continue
+
+        try:
+            review_message = await review_channel.fetch_message(review_message_id)
+            await review_message.edit(
+                embed=create_vault_review_embed(
+                    submission,
+                    status_note="⌛ Expired — a new day started before this was reviewed.",
+                ),
+                view=None,
+            )
+        except discord.NotFound:
+            pass  # review card already gone — nothing to update
+        except discord.HTTPException as e:
+            logger.warning(f"Failed to mark vault submission {submission_id} as expired: {e}")
+
+    if expired_count:
+        logger.info(f"Expired {expired_count} stale pending vault submission(s) during daily reset")
+
+    _cleanup_old_vault_submissions()
+
+    persist_state()
+
+
 # ==========================================================
 # BACKGROUND MONITOR
 # ==========================================================
@@ -1862,6 +2659,7 @@ async def _monitor_tick():
             GUILD_TASK_CHANNEL_ID,
             SANCTUARY_CHANNEL_ID,
             ERROR_ALERT_CHANNEL_ID,
+            VAULT_CHANNEL_ID,
         ]
     )
 
@@ -1886,22 +2684,18 @@ async def _monitor_tick():
             persist_state()
         raid = None
 
+    raid_just_started = False
+
     if raid is not None:
         if no_raid_logged:
             no_raid_logged = False
             persist_state()
 
         if raid_is_new(raid, last_raid_started):
-            logger.info("New raid detected, sending notification")
+            logger.info("New raid detected, highlighting status message")
             commit_raid_seen(raid)
-            ping_content = f"<@&{RAID_ROLE_ID}>" if RAID_ROLE_ID else None
-            await send_notification(
-                channels,
-                RAID_CHANNEL_ID,
-                content=ping_content,
-                embed=create_raid_embed(raid),
-                expire_seconds=RAID_START_NOTIFICATION_LIFETIME_SECONDS,
-            )
+            _set_highlight("raid", "started", _raid_highlight_duration(raid))
+            raid_just_started = True
             raid_reminder_sent = False
             persist_state()
         elif not raid_reminder_sent and raid_expiring_soon(raid):
@@ -1910,6 +2704,7 @@ async def _monitor_tick():
             await send_notification(
                 channels,
                 RAID_CHANNEL_ID,
+                content=_role_ping_content(RAID_ROLE_ID),
                 embed=create_raid_reminder_embed(raid),
                 expire_at=raid_expire_at,
                 expire_seconds=None if raid_expire_at else DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
@@ -1918,25 +2713,29 @@ async def _monitor_tick():
             persist_state()
 
     if raid_fetch_ok:
+        raid_highlighted = _active_highlight("raid") == "started"
         await upsert_status_message(
-            channels, RAID_CHANNEL_ID, "raid", create_raid_status_embed(raid)
+            channels,
+            RAID_CHANNEL_ID,
+            "raid",
+            create_raid_status_embed(raid, highlighted=raid_highlighted),
+            content=_role_ping_content(RAID_ROLE_ID) if raid_just_started else None,
         )
 
     newly_active_orphanage, orphanage_tiers = await check_orphanage()
+    orphanage_just_changed = False
     if newly_active_orphanage:
-        logger.info("New orphanage tier active, sending notification")
-        await send_notification(
-            channels,
-            ORPHANAGE_CHANNEL_ID,
-            embed=create_orphanage_embed(newly_active_orphanage),
-            expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
-        )
+        logger.info("New orphanage tier active, highlighting status message")
+        _set_highlight("orphanage", "new_tier", ORPHANAGE_HIGHLIGHT_SECONDS)
+        orphanage_just_changed = True
     if orphanage_tiers is not None:
+        orphanage_highlight = _active_highlight("orphanage")
         await upsert_status_message(
             channels,
             ORPHANAGE_CHANNEL_ID,
             "orphanage",
-            create_orphanage_status_embed(orphanage_tiers),
+            create_orphanage_status_embed(orphanage_tiers, highlight_kind=orphanage_highlight),
+            content=_role_ping_content(ORPHANAGE_ROLE_ID) if orphanage_just_changed else None,
         )
 
     boss_activated, boss_killed, boss_incoming, bosses = await check_worldboss()
@@ -1952,6 +2751,7 @@ async def _monitor_tick():
         message = await send_notification(
             channels,
             WORLDBOSS_CHANNEL_ID,
+            content=_role_ping_content(WORLDBOSS_ROLE_ID),
             embed=create_worldboss_embed(boss, killed=False),
             expire_seconds=24 * 60 * 60,
         )
@@ -2009,60 +2809,63 @@ async def _monitor_tick():
         )
 
     task_event, task = await check_guild_task()
+
+    guild_task_just_changed = False
     if task_event:
-        event_type, event_task = task_event
-        if event_type == "new":
-            logger.info("New guild task detected, sending notification")
-            await send_notification(
-                channels,
-                GUILD_TASK_CHANNEL_ID,
-                embed=create_guild_task_embed(event_task, completed=False),
-                expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
-            )
-        elif event_type == "completed":
-            logger.info("Guild task completed, sending notification")
-            await send_notification(
-                channels,
-                GUILD_TASK_CHANNEL_ID,
-                embed=create_guild_task_embed(event_task, completed=True),
-                expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
-            )
+        event_type, _event_task = task_event
+        logger.info(f"Guild task {event_type}, highlighting status message")
+        _set_highlight("guild_task", event_type, GUILD_TASK_HIGHLIGHT_SECONDS)
+        guild_task_just_changed = True
+
     if task is not None:
+        active_highlight = _active_highlight("guild_task")
         await upsert_status_message(
             channels,
             GUILD_TASK_CHANNEL_ID,
             "guild_task",
-            create_guild_task_status_embed_safe(task),
+            create_guild_task_status_embed_safe(task, highlight_kind=active_highlight),
+            content=_role_ping_content(GUILD_TASK_ROLE_ID) if guild_task_just_changed else None,
         )
 
     sanctuary_active, sanctuary_completed, sanctuary_tiers = await check_sanctuary()
+    sanctuary_just_changed = False
     if sanctuary_active:
         logger.info(
             f"Sanctuary tier became active: {sanctuary_active.get('tier', {}).get('name')}"
         )
-        await send_notification(
-            channels,
-            SANCTUARY_CHANNEL_ID,
-            embed=create_sanctuary_active_embed(sanctuary_active),
-            expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
-        )
-    for tier in sanctuary_completed:
-        logger.info(
-            f"Sanctuary tier goal reached: {tier.get('tier', {}).get('name')}"
-        )
-        await send_notification(
-            channels,
-            SANCTUARY_CHANNEL_ID,
-            embed=create_sanctuary_completed_embed(tier),
-            expire_seconds=DEFAULT_NOTIFICATION_LIFETIME_SECONDS,
-        )
+        _set_highlight("sanctuary", "active", SANCTUARY_HIGHLIGHT_SECONDS)
+        sanctuary_just_changed = True
+    if sanctuary_completed:
+        for tier in sanctuary_completed:
+            logger.info(
+                f"Sanctuary tier goal reached: {tier.get('tier', {}).get('name')}"
+            )
+        # "completed" takes priority over "active" if both happen the same
+        # tick — reaching a goal is the more exciting of the two.
+        _set_highlight("sanctuary", "completed", SANCTUARY_HIGHLIGHT_SECONDS)
+        sanctuary_just_changed = True
     if sanctuary_tiers is not None:
+        sanctuary_highlight = _active_highlight("sanctuary")
         await upsert_status_message(
             channels,
             SANCTUARY_CHANNEL_ID,
             "sanctuary",
-            create_sanctuary_status_embed(sanctuary_tiers),
+            create_sanctuary_status_embed(sanctuary_tiers, highlight_kind=sanctuary_highlight),
+            content=_role_ping_content(SANCTUARY_ROLE_ID) if sanctuary_just_changed else None,
         )
+
+    # Keeps the vault status message alive and lets its "just published"
+    # highlight revert on schedule (see VAULT_HIGHLIGHT_SECONDS). The
+    # actual publish (and its role ping) happens immediately in
+    # _handle_vault_review when an admin approves a submission, not here —
+    # this tick is what makes sure a placeholder exists from the very
+    # first tick after startup, and keeps the message current afterwards.
+    await upsert_status_message(
+        channels,
+        VAULT_CHANNEL_ID,
+        "vault",
+        create_vault_status_embed(current_vault, highlight_kind=_active_highlight("vault")),
+    )
 
     # Warn once per endpoint if the API key seems to be failing repeatedly
     # on that specific endpoint (see _handle_response for how counts accrue).
@@ -2101,6 +2904,19 @@ async def on_ready():
     # non-persistent views on restart; this re-attaches by custom_id).
     bot.add_view(WorldBossCarouselView())
 
+    # Same idea for every vault submission still awaiting review: each one
+    # needs its own view instance since its buttons' custom_id embeds that
+    # specific submission's ID (see VaultReviewView).
+    pending_vault_count = 0
+    for submission_id, submission in vault_submissions.items():
+        if submission.get("status") == "pending":
+            bot.add_view(VaultReviewView(submission_id))
+            pending_vault_count += 1
+    if pending_vault_count:
+        logger.info(f"Re-registered {pending_vault_count} pending vault review view(s)")
+
+    await _check_role_ping_configuration()
+
     if not _synced:
         await bot.tree.sync()
         _synced = True
@@ -2113,6 +2929,12 @@ async def on_ready():
         logger.info("Monitoring started")
     else:
         logger.info("Monitor already running")
+
+    if not vault_daily_reset.is_running():
+        vault_daily_reset.start()
+        logger.info(f"Vault daily reset scheduled for {VAULT_RESET_TIME} {VAULT_RESET_TIMEZONE}")
+    else:
+        logger.info("Vault daily reset already scheduled")
 
     logger.info("Bot is ready")
 
@@ -2164,12 +2986,24 @@ async def on_app_command_error(
 # ==========================================================
 
 
+# Commands allowed to run in any channel, bypassing COMMANDS_CHANNEL_ID
+# below. Currently /vault and /vault_cancel: unlike every other command
+# here (all read-only status lookups), these are how people REPORT or
+# WITHDRAW something they just found in-game, so requiring a detour
+# through a specific commands channel only adds friction with no benefit.
+COMMANDS_CHANNEL_EXEMPTIONS = {"vault", "vault_cancel"}
+
+
 async def _restrict_commands_to_channel(interaction: discord.Interaction) -> bool:
     """Global check applied to every slash command via bot.tree.interaction_check
     (see assignment below). If COMMANDS_CHANNEL_ID is configured, commands
-    used anywhere else get a friendly ephemeral redirect instead of running.
+    used anywhere else get a friendly ephemeral redirect instead of running,
+    EXCEPT for COMMANDS_CHANNEL_EXEMPTIONS (see above), which always run.
     If COMMANDS_CHANNEL_ID is not set, this is a no-op and commands work
     anywhere, same as before this feature existed."""
+    if interaction.command and interaction.command.name in COMMANDS_CHANNEL_EXEMPTIONS:
+        return True
+
     if COMMANDS_CHANNEL_ID is None or interaction.channel_id == COMMANDS_CHANNEL_ID:
         return True
 
@@ -2183,7 +3017,7 @@ bot.tree.interaction_check = _restrict_commands_to_channel
 
 
 @bot.tree.command(name="raid", description="Show the current guild raid status")
-@discord.app_commands.checks.cooldown(1, 15.0)
+@discord.app_commands.checks.cooldown(1, 15.0, key=lambda i: i.channel_id)
 async def raid_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -2205,7 +3039,7 @@ async def raid_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="orphanage", description="Show the current orphanage status")
-@discord.app_commands.checks.cooldown(1, 15.0)
+@discord.app_commands.checks.cooldown(1, 15.0, key=lambda i: i.channel_id)
 async def orphanage_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -2240,7 +3074,7 @@ async def orphanage_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="sanctuary", description="Show the current guild sanctuary status")
-@discord.app_commands.checks.cooldown(1, 15.0)
+@discord.app_commands.checks.cooldown(1, 15.0, key=lambda i: i.channel_id)
 async def sanctuary_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -2256,7 +3090,7 @@ async def sanctuary_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="task", description="Show the current guild task status")
-@discord.app_commands.checks.cooldown(1, 15.0)
+@discord.app_commands.checks.cooldown(1, 15.0, key=lambda i: i.channel_id)
 async def task_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -2276,7 +3110,7 @@ async def task_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="worldboss", description="Show the current world boss (browsable)")
-@discord.app_commands.checks.cooldown(1, 15.0)
+@discord.app_commands.checks.cooldown(1, 15.0, key=lambda i: i.channel_id)
 async def worldboss_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -2299,7 +3133,7 @@ async def worldboss_command(interaction: discord.Interaction):
 @discord.app_commands.describe(
     count="How many upcoming bosses to show (default 1, max 15)"
 )
-@discord.app_commands.checks.cooldown(1, 15.0)
+@discord.app_commands.checks.cooldown(1, 15.0, key=lambda i: i.channel_id)
 async def next_bosses_command(
     interaction: discord.Interaction,
     count: discord.app_commands.Range[int, 1, 15] = 1,
@@ -2340,6 +3174,182 @@ async def next_bosses_command(
             inline=False,
         )
     await interaction.followup.send(embed=_finalize_embed(embed))
+
+
+@bot.tree.command(name="vault", description="Submit today's vault code for admin review before it's published")
+@discord.app_commands.describe(
+    code="The daily vault code",
+    bonus="Vault bonus percentage, applied to all categories (e.g. 40)",
+    location="Optional: where this code was found/posted (shown as 'at ...')",
+)
+@discord.app_commands.checks.cooldown(1, 15.0)
+async def vault_command(
+    interaction: discord.Interaction,
+    code: str,
+    bonus: discord.app_commands.Range[int, 1, 100],
+    location: str = None,
+):
+    code = code.strip()
+    if not code or len(code) > 50:
+        await _safe_respond(
+            interaction,
+            "⚠️ That doesn't look like a valid code — it should be non-empty and under 50 characters.",
+        )
+        return
+
+    if location:
+        location = location.strip()[:100] or None
+
+    if current_vault:
+        await _safe_respond(
+            interaction,
+            f"ℹ️ Today's vault code (`{current_vault['code']}`) has already been published. "
+            f"Submissions reopen {format_unix_relative(_next_vault_reset_timestamp())}.",
+        )
+        return
+
+    submission_id = _next_vault_submission_id()
+    submission = {
+        "id": submission_id,
+        "code": code,
+        "bonus_percent": bonus,
+        "location": location,
+        "submitter_id": interaction.user.id,
+        "submitter_name": interaction.user.display_name,
+        "status": "pending",
+        "review_channel_id": None,
+        "review_message_id": None,
+        "reviewed_by_id": None,
+        "reviewed_by_name": None,
+        "created_at": time.time(),
+    }
+
+    review_channel = await _resolve_text_channel(VAULT_REVIEW_CHANNEL_ID)
+    if review_channel is None:
+        logger.warning("Could not resolve VAULT_REVIEW_CHANNEL_ID for a new vault submission")
+        await _safe_respond(
+            interaction, "⚠️ Couldn't reach the review channel right now — please try again later."
+        )
+        return
+
+    try:
+        review_message = await review_channel.send(
+            embed=create_vault_review_embed(submission), view=VaultReviewView(submission_id)
+        )
+    except discord.HTTPException as e:
+        logger.warning(f"Failed to post vault review card: {e}")
+        await _safe_respond(
+            interaction, "⚠️ Something went wrong submitting your code — please try again later."
+        )
+        return
+
+    submission["review_channel_id"] = review_channel.id
+    submission["review_message_id"] = review_message.id
+    vault_submissions[submission_id] = submission
+    persist_state()
+
+    logger.info(f"New vault submission {submission_id} from {interaction.user} (code: {code})")
+
+    await _safe_respond(interaction, "✅ Thanks! Your vault code has been submitted and is awaiting admin review.")
+
+
+@bot.tree.command(name="vault_cancel", description="Withdraw your own pending vault code submission")
+@discord.app_commands.checks.cooldown(1, 15.0)
+async def vault_cancel_command(interaction: discord.Interaction):
+    user_pending = [
+        (sid, sub)
+        for sid, sub in vault_submissions.items()
+        if sub.get("submitter_id") == interaction.user.id and sub.get("status") == "pending"
+    ]
+
+    if not user_pending:
+        await _safe_respond(interaction, "ℹ️ You don't have a pending vault code submission to cancel.")
+        return
+
+    # Normally there's at most one: the /vault command itself refuses new
+    # submissions once a code is already published, so a second pending
+    # submission from the same user shouldn't happen in practice. Picking
+    # the most recent one defensively handles it anyway rather than
+    # assuming exactly one is ever present.
+    submission_id, submission = max(user_pending, key=lambda kv: kv[1].get("created_at", 0))
+    submission["status"] = "cancelled"
+    persist_state()
+
+    review_channel_id = submission.get("review_channel_id")
+    review_message_id = submission.get("review_message_id")
+    if review_channel_id and review_message_id:
+        review_channel = await _resolve_text_channel(review_channel_id)
+        if review_channel is not None:
+            try:
+                review_message = await review_channel.fetch_message(review_message_id)
+                await review_message.edit(
+                    embed=create_vault_review_embed(
+                        submission, status_note=f"🚫 Withdrawn by {interaction.user.mention}"
+                    ),
+                    view=None,
+                )
+            except discord.NotFound:
+                pass  # review card already gone — nothing to update
+            except discord.HTTPException as e:
+                logger.warning(
+                    f"Failed to update vault review card for cancelled submission {submission_id}: {e}"
+                )
+
+    await _safe_respond(
+        interaction, f"✅ Your vault code submission (`{submission['code']}`) has been withdrawn."
+    )
+    logger.info(f"Vault submission {submission_id} cancelled by {interaction.user}")
+
+
+@bot.tree.command(name="help", description="Show all available commands")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🤖 SimpleMMO Bot — Commands",
+        description="Here's everything you can ask me to do.",
+        color=COLOR_GUILD_TASK,
+    )
+
+    embed.add_field(
+        name="📊 Status lookups",
+        value=(
+            "`/raid` — current guild raid status\n"
+            "`/worldboss` — browse active/upcoming world bosses\n"
+            "`/nextbosses [count]` — upcoming world boss spawns\n"
+            "`/orphanage` — current orphanage tier status\n"
+            "`/sanctuary` — guild sanctuary tier status\n"
+            "`/task` — current guild task status"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🗝️ Vault codes",
+        value=(
+            "`/vault` — submit today's vault code for admin review\n"
+            "`/vault_cancel` — withdraw your own pending submission"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔧 Bot info",
+        value=(
+            "`/status` — bot status and API request usage\n"
+            "`/uptime` — how long the bot has been running\n"
+            "`/help` — this message"
+        ),
+        inline=False,
+    )
+
+    if COMMANDS_CHANNEL_ID is not None:
+        embed.add_field(
+            name="ℹ️ Note",
+            value=(
+                f"Most commands only work in <#{COMMANDS_CHANNEL_ID}>. "
+                f"`/vault` and `/vault_cancel` work anywhere."
+            ),
+            inline=False,
+        )
+
+    await interaction.response.send_message(embed=_finalize_embed(embed))
 
 
 @bot.tree.command(name="status", description="Show bot status")
@@ -2391,6 +3401,9 @@ async def _graceful_shutdown(sig=None):
 
     if monitor.is_running():
         monitor.cancel()
+
+    if vault_daily_reset.is_running():
+        vault_daily_reset.cancel()
 
     persist_state()
     await close_session()
